@@ -81,3 +81,78 @@ impl KerberosRealm {
         format!("{}-kdc", self.metadata.name.as_deref().unwrap_or("realm"))
     }
 }
+
+/// What happens to the principals when their `KerberosPrincipal` is
+/// deleted.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub enum DeletionPolicy {
+    /// Delete them from the KDC (the default).
+    #[default]
+    Delete,
+    /// Leave them in the KDC (keytabs elsewhere keep working).
+    Retain,
+}
+
+/// Principals with random keys, created through kadmind, and a Secret
+/// holding their keytab.
+#[derive(CustomResource, Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+#[kube(
+    group = "krb5.ddalton.dev",
+    version = "v1alpha1",
+    kind = "KerberosPrincipal",
+    namespaced,
+    status = "KerberosPrincipalStatus",
+    shortname = "kprinc",
+    printcolumn = r#"{"name":"Realm","type":"string","jsonPath":".spec.realmRef"}"#,
+    printcolumn = r#"{"name":"Ready","type":"string","jsonPath":".status.conditions[?(@.type==\"Ready\")].status"}"#,
+    printcolumn = r#"{"name":"Secret","type":"string","jsonPath":".status.secretName"}"#
+)]
+#[serde(rename_all = "camelCase")]
+pub struct KerberosPrincipalSpec {
+    /// The `KerberosRealm` (same namespace) the principals belong to.
+    pub realm_ref: String,
+    /// Principal names (`nn/host.example.com`): the realm is appended, or,
+    /// if given (`...@REALM`), must be the realm's.
+    pub principals: Vec<String>,
+    /// The Secret to write the keytab to (default: this object's name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_name: Option<String>,
+    /// The key in that Secret (default `krb5.keytab`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keytab_key: Option<String>,
+    /// `Delete` (default) or `Retain` the principals when this is deleted.
+    #[serde(default)]
+    pub deletion_policy: DeletionPolicy,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct KerberosPrincipalStatus {
+    /// The Secret holding the keytab.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_name: Option<String>,
+    /// Each principal (with its realm) and its key version.
+    #[serde(default)]
+    pub principals: Vec<PrincipalStatus>,
+    #[serde(default)]
+    pub conditions: Vec<Condition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrincipalStatus {
+    pub name: String,
+    pub kvno: u32,
+}
+
+impl KerberosPrincipal {
+    pub fn secret_name(&self) -> String {
+        self.spec.secret_name.clone().unwrap_or_else(|| self.metadata.name.clone().unwrap_or_default())
+    }
+
+    pub fn keytab_key(&self) -> String {
+        self.spec.keytab_key.clone().unwrap_or_else(|| "krb5.keytab".into())
+    }
+}

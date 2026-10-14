@@ -1,0 +1,86 @@
+# The operator: its namespace, service account, RBAC and Deployment.
+# Apply deploy/crds.yaml first.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: krb5-operator
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: krb5-operator
+  namespace: krb5-operator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: krb5-operator
+rules:
+  - apiGroups: [krb5.ddalton.dev]
+    resources: [kerberosrealms, kerberosprincipals]
+    verbs: [get, list, watch, patch, update]
+  - apiGroups: [krb5.ddalton.dev]
+    resources: [kerberosrealms/status, kerberosprincipals/status, kerberosprincipals/finalizers]
+    verbs: [get, patch, update]
+  # Realms: the master key and admin password; principals: keytabs.
+  - apiGroups: [""]
+    resources: [secrets, configmaps, services]
+    verbs: [get, list, watch, create, patch, update]
+  - apiGroups: [apps]
+    resources: [statefulsets]
+    verbs: [get, list, watch, create, patch, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: krb5-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: krb5-operator
+subjects:
+  - kind: ServiceAccount
+    name: krb5-operator
+    namespace: krb5-operator
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: krb5-operator
+  namespace: krb5-operator
+  labels:
+    app.kubernetes.io/name: krb5-operator
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: krb5-operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: krb5-operator
+    spec:
+      serviceAccountName: krb5-operator
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: operator
+          image: ghcr.io/ddalton/krb5-operator:0.1.0
+          env:
+            - name: RUST_LOG
+              value: info,krb5=warn
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]

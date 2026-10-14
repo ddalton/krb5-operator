@@ -1,0 +1,43 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kinit-after-restart
+spec:
+  backoffLimit: 6
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: kinit
+        image: krb5-kdc:e2e
+        imagePullPolicy: Never
+        command: [sh, -euxc]
+        args:
+        - |
+          klist -k -e /keytab/krb5.keytab
+          kinit -k -t /keytab/krb5.keytab nn/namenode.example.com@CORP.TEST
+          klist
+          kinit -k -t /keytab/krb5.keytab hdfs
+          klist
+          # A service ticket for the NameNode, as a client would get one.
+          kvno nn/namenode.example.com
+        env:
+        - name: KRB5_CONFIG
+          value: /etc/krb5/krb5.conf
+        - name: KRB5CCNAME
+          value: FILE:/tmp/cc
+        volumeMounts:
+        - name: keytab
+          mountPath: /keytab
+        - name: krb5
+          mountPath: /etc/krb5
+      volumes:
+      - name: keytab
+        secret:
+          secretName: services
+      - name: krb5
+        configMap:
+          name: corp-kdc
+          items:
+          - key: krb5.conf
+            path: krb5.conf
