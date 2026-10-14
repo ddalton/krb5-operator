@@ -1,0 +1,23 @@
+[package]
+name = "krb5-operator"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Kubernetes operator for MIT Kerberos realms and principals"
+repository = "https://github.com/ddalton/krb5-operator"
+
+[dependencies]
+kube = { version = "4.2", default-features = false, features = ["client", "rustls-tls", "ring", "runtime", "derive"] }
+k8s-openapi = { version = "0.28", features = ["v1_32", "schemars"] }
+schemars = "1"
+krb5 = "0.7"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.8"
+anyhow = "1"
