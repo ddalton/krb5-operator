@@ -1,0 +1,31 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/kyverno/chainsaw/v0.2.15/.schemas/json/configuration-chainsaw-v1alpha2.json
+# The operator's end-to-end tests, on a kind cluster with the operator
+# running in it. Run: ./kind.sh (builds the images, creates the cluster,
+# installs the operator, runs this).
+apiVersion: chainsaw.kyverno.io/v1alpha2
+kind: Configuration
+metadata:
+  name: krb5-operator
+spec:
+  timeouts:
+    apply: 30s
+    assert: 240s
+    cleanup: 120s
+    delete: 120s
+    error: 120s
+    exec: 240s
+  discovery:
+    testFile: chainsaw-test
+  # Scripts use $(...) and $VAR for the shell, not for chainsaw.
+  templating:
+    enabled: false
+  error:
+    catch:
+    - events: {}
+    - podLogs:
+        namespace: krb5-operator
+        selector: app.kubernetes.io/name=krb5-operator
+        tail: 100
+    - podLogs:
+        selector: app.kubernetes.io/name=krb5-kdc
+        tail: 100

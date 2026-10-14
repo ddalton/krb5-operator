@@ -1,0 +1,102 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/kyverno/chainsaw/v0.2.15/.schemas/json/test-chainsaw-v1alpha1.json
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: realm-and-principals
+spec:
+  description: >-
+    A KerberosRealm becomes an MIT KDC that answers; a KerberosPrincipal
+    becomes principals in it and a keytab Secret MIT's kinit logs in with;
+    the database survives the KDC pod's restart with the keys unchanged; and
+    deleting the KerberosPrincipal deletes the principals and the Secret.
+  steps:
+  - name: realm
+    try:
+    - apply:
+        file: realm.yaml
+    - assert:
+        resource:
+          apiVersion: krb5.ddalton.dev/v1alpha1
+          kind: KerberosRealm
+          metadata:
+            name: corp
+          status:
+            krb5ConfConfigMap: corp-kdc
+            (conditions[?type == 'Ready']):
+            - status: "True"
+  - name: principals
+    try:
+    - apply:
+        file: principals.yaml
+    - assert:
+        resource:
+          apiVersion: krb5.ddalton.dev/v1alpha1
+          kind: KerberosPrincipal
+          metadata:
+            name: services
+          status:
+            secretName: services
+            (length(principals)): 2
+            (conditions[?type == 'Ready']):
+            - status: "True"
+  - name: mit-kinit-with-the-keytab
+    try:
+    - apply:
+        file: kinit.yaml
+    - assert:
+        resource:
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: kinit
+          status:
+            succeeded: 1
+    catch:
+    - podLogs:
+        selector: job-name=kinit
+  - name: kdc-restart-keeps-the-database
+    try:
+    - script:
+        content: |
+          set -eux
+          before=$(kubectl -n "$NAMESPACE" get secret services -o jsonpath='{.data.krb5\.keytab}')
+          kubectl -n "$NAMESPACE" delete pod corp-kdc-0 --wait
+          kubectl -n "$NAMESPACE" rollout status statefulset/corp-kdc --timeout=180s
+          # The operator re-syncs; the keys are the same, so is the Secret.
+          sleep 5
+          after=$(kubectl -n "$NAMESPACE" get secret services -o jsonpath='{.data.krb5\.keytab}')
+          [ "$before" = "$after" ]
+    - apply:
+        file: kinit-after-restart.yaml
+    - assert:
+        resource:
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: kinit-after-restart
+          status:
+            succeeded: 1
+    catch:
+    - podLogs:
+        selector: job-name=kinit-after-restart
+  - name: deleting-removes-the-principals
+    try:
+    - delete:
+        ref:
+          apiVersion: krb5.ddalton.dev/v1alpha1
+          kind: KerberosPrincipal
+          name: services
+    - error:
+        resource:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: services
+    - script:
+        content: |
+          set -eux
+          out=$(kubectl -n "$NAMESPACE" exec corp-kdc-0 -- kadmin.local -r CORP.TEST -q 'getprinc hdfs' 2>&1 || true)
+          echo "$out"
+          echo "$out" | grep -q 'does not exist'
+          out=$(kubectl -n "$NAMESPACE" exec corp-kdc-0 -- kadmin.local -r CORP.TEST -q 'getprinc nn/namenode.example.com' 2>&1 || true)
+          echo "$out" | grep -q 'does not exist'

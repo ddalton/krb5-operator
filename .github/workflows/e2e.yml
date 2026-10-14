@@ -1,0 +1,57 @@
+# The end-to-end tests (tests/e2e, Chainsaw) on a kind cluster on the
+# hosted runner, against images built from this commit. The job is
+# tests/e2e/kind.sh and nothing else, so a red run reproduces on any host
+# with docker by running that script.
+name: e2e
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  KIND_VERSION: v0.30.0
+  KIND_NODE_IMAGE: kindest/node:v1.34.0
+  CHAINSAW_VERSION: v0.2.15
+
+jobs:
+  chainsaw:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install kind + chainsaw
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/bin"
+          curl -fsSL "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64" -o "$HOME/bin/kind"
+          curl -fsSL "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64.sha256sum" |
+            sed "s|kind-linux-amd64|$HOME/bin/kind|" | sha256sum -c -
+          chmod +x "$HOME/bin/kind"
+          cd /tmp
+          curl -fsSLO "https://github.com/kyverno/chainsaw/releases/download/${CHAINSAW_VERSION}/chainsaw_linux_amd64.tar.gz"
+          curl -fsSL "https://github.com/kyverno/chainsaw/releases/download/${CHAINSAW_VERSION}/checksums.txt" |
+            grep ' chainsaw_linux_amd64.tar.gz$' | sha256sum -c -
+          tar -xzf chainsaw_linux_amd64.tar.gz chainsaw
+          install -m 0755 chainsaw "$HOME/bin/chainsaw"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: tests/e2e/kind.sh
+        env:
+          REPORT_DIR: ${{ runner.temp }}/chainsaw-report
+        run: |
+          kind version; kubectl version --client; chainsaw version
+          tests/e2e/kind.sh
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chainsaw-report
+          path: ${{ runner.temp }}/chainsaw-report
+          if-no-files-found: ignore

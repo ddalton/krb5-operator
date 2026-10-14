@@ -1,0 +1,9 @@
+apiVersion: krb5.ddalton.dev/v1alpha1
+kind: KerberosPrincipal
+metadata:
+  name: services
+spec:
+  realmRef: corp
+  principals:
+  - nn/namenode.example.com
+  - hdfs

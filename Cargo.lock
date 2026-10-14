@@ -983,9 +983,8 @@ dependencies = [
 
 [[package]]
 name = "krb5"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1bd67d1d095e9481d598aea7e388d23a9abd2626bd96f53de0ce0d75eb29b18"
+version = "0.8.0"
+source = "git+https://github.com/ddalton/krb5?rev=a2b0873#a2b08737588504224f3528eeb1cfa6c499d98e11"
 dependencies = [
  "aes",
  "chrono",

@@ -1,0 +1,33 @@
+# fmt, clippy, and the tests, the live ones (principal.rs, `live_`) against
+# an MIT KDC and kadmind set up as the KDC image sets up a realm.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq krb5-kdc krb5-admin-server
+      - run: scripts/test-kdc.sh "$RUNNER_TEMP/kdc"
+      - run: cat "$RUNNER_TEMP/kdc/test.env" >> "$GITHUB_ENV"
+      - run: cargo test -- --nocapture
+      - if: failure()
+        run: tail -n 50 "$RUNNER_TEMP"/kdc/*.out "$RUNNER_TEMP"/kdc/*.log || true

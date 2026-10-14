@@ -2,7 +2,10 @@
 //! whether it answers.
 //!
 //! - Secret `<name>-kdc`: the database master key (generated once, never
-//!   changed: it decrypts the database).
+//!   changed: it decrypts the database) and the password of the operator's
+//!   own admin principal, `krb5-operator/admin`, which the image (re)sets
+//!   at every start and `kadm5.acl` lets do everything, key extraction
+//!   included.
 //! - ConfigMap `<name>-kdc`: `kdc.conf` for the KDC and a client
 //!   `krb5.conf` that points at the Service; workloads mount it.
 //! - StatefulSet `<name>-kdc` (one replica): krb5kdc and kadmind, the
@@ -17,16 +20,16 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use k8s_openapi::ByteString;
 use k8s_openapi::api::apps::v1::{StatefulSet, StatefulSetSpec};
 use k8s_openapi::api::core::v1::{
     ConfigMap, ConfigMapVolumeSource, Container, ContainerPort, EnvVar, EnvVarSource, PersistentVolumeClaim,
-    PersistentVolumeClaimSpec, PodSpec, PodTemplateSpec, Probe, SecretKeySelector, Service, ServicePort, ServiceSpec,
-    TCPSocketAction, Volume, VolumeMount, VolumeResourceRequirements,
+    PersistentVolumeClaimSpec, PodSpec, PodTemplateSpec, Probe, Secret, SecretKeySelector, Service, ServicePort,
+    ServiceSpec, TCPSocketAction, Volume, VolumeMount, VolumeResourceRequirements,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use k8s_openapi::ByteString;
 use kube::api::{Api, Patch, PatchParams};
 use kube::runtime::controller::Action;
 use kube::{Client, Resource, ResourceExt};
@@ -34,12 +37,15 @@ use rand::Rng;
 use serde_json::json;
 use tracing::{info, warn};
 
-use crate::crd::{Condition, KerberosRealm, KerberosRealmStatus, DEFAULT_KDC_IMAGE};
+use crate::crd::{Condition, DEFAULT_KDC_IMAGE, KerberosRealm, KerberosRealmStatus};
 
 pub const KDC_PORT: i32 = 88;
 pub const KADMIN_PORT: i32 = 749;
 const MANAGER: &str = "krb5-operator";
 const MASTER_KEY: &str = "master-key";
+const ADMIN_PASSWORD: &str = "admin-password";
+/// The operator's principal in every realm it runs.
+pub const ADMIN: &str = "krb5-operator/admin";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -101,7 +107,8 @@ pub fn config_files(realm: &KerberosRealm) -> BTreeMap<String, String> {
          [realms]\n    {r} = {{\n        database_name = /var/lib/krb5kdc/principal\n        \
          key_stash_file = /var/lib/krb5kdc/.k5.{r}\n        acl_file = /etc/krb5kdc/kadm5.acl\n        \
          kadmind_port = {KADMIN_PORT}\n        max_life = {life}\n        max_renewable_life = {renew}\n        \
-         supported_enctypes = aes256-cts-hmac-sha1-96:normal aes128-cts-hmac-sha1-96:normal aes256-cts-hmac-sha384-192:normal aes128-cts-hmac-sha256-128:normal\n    }}\n"
+         supported_enctypes = aes256-cts-hmac-sha1-96:normal aes128-cts-hmac-sha1-96:normal aes256-cts-hmac-sha384-192:normal aes128-cts-hmac-sha256-128:normal\n    }}\n\n\
+         [logging]\n    kdc = STDERR\n    admin_server = STDERR\n"
     );
     let krb5_conf = format!(
         "[libdefaults]\n    default_realm = {r}\n    dns_lookup_kdc = false\n    dns_lookup_realm = false\n    \
@@ -111,9 +118,9 @@ pub fn config_files(realm: &KerberosRealm) -> BTreeMap<String, String> {
     BTreeMap::from([
         ("kdc.conf".to_string(), kdc_conf),
         ("krb5.conf".to_string(), krb5_conf),
-        // kadmind: nobody administers remotely yet; the operator uses
-        // kadmin.local in the pod.
-        ("kadm5.acl".to_string(), String::new()),
+        // kadmind: the operator may do everything, extract keys too (`e`
+        // is not part of `x`).
+        ("kadm5.acl".to_string(), format!("{ADMIN}@{r} xe\n")),
     ])
 }
 
@@ -121,9 +128,31 @@ pub fn config_map(realm: &KerberosRealm) -> ConfigMap {
     ConfigMap { metadata: meta(realm), data: Some(config_files(realm)), ..Default::default() }
 }
 
-/// A new random master key (only used when the Secret does not exist).
-fn new_master_key() -> String {
+/// A new random master key or admin password (only used when the Secret
+/// lacks it).
+fn new_secret() -> String {
     rand::thread_rng().sample_iter(&rand::distributions::Alphanumeric).take(48).map(char::from).collect()
+}
+
+fn secret_env(var: &str, secret: &str, key: &str) -> EnvVar {
+    EnvVar {
+        name: var.into(),
+        value_from: Some(EnvVarSource {
+            secret_key_ref: Some(SecretKeySelector { name: secret.into(), key: key.into(), optional: Some(false) }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// The password of the operator's admin principal in `realm`.
+pub async fn admin_password(client: &Client, realm: &KerberosRealm) -> Result<Option<String>, Error> {
+    let ns = realm.namespace().unwrap_or_else(|| "default".into());
+    let secret = Api::<Secret>::namespaced(client.clone(), &ns).get_opt(&realm.base_name()).await?;
+    Ok(secret
+        .and_then(|s| s.data)
+        .and_then(|d| d.get(ADMIN_PASSWORD).cloned())
+        .and_then(|b| String::from_utf8(b.0).ok()))
 }
 
 pub fn stateful_set(realm: &KerberosRealm) -> StatefulSet {
@@ -148,16 +177,15 @@ pub fn stateful_set(realm: &KerberosRealm) -> StatefulSet {
         image: Some(image),
         env: Some(vec![
             EnvVar { name: "KRB5_REALM".into(), value: Some(realm.spec.realm.clone()), ..Default::default() },
-            EnvVar {
-                name: "KRB5_MASTER_KEY".into(),
-                value_from: Some(EnvVarSource {
-                    secret_key_ref: Some(SecretKeySelector { name: name.clone(), key: MASTER_KEY.into(), optional: Some(false) }),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
+            secret_env("KRB5_MASTER_KEY", &name, MASTER_KEY),
+            secret_env("KRB5_ADMIN_PASSWORD", &name, ADMIN_PASSWORD),
+            EnvVar { name: "KRB5_ADMIN_PRINCIPAL".into(), value: Some(ADMIN.into()), ..Default::default() },
         ]),
-        ports: Some(vec![port("kdc-tcp", KDC_PORT, "TCP"), port("kdc-udp", KDC_PORT, "UDP"), port("kadmin", KADMIN_PORT, "TCP")]),
+        ports: Some(vec![
+            port("kdc-tcp", KDC_PORT, "TCP"),
+            port("kdc-udp", KDC_PORT, "UDP"),
+            port("kadmin", KADMIN_PORT, "TCP"),
+        ]),
         volume_mounts: Some(vec![
             VolumeMount { name: "data".into(), mount_path: "/var/lib/krb5kdc".into(), ..Default::default() },
             config("kdc.conf", "/etc/krb5kdc/kdc.conf"),
@@ -221,7 +249,11 @@ pub fn service(realm: &KerberosRealm) -> Service {
         metadata: meta(realm),
         spec: Some(ServiceSpec {
             selector: Some(labels(realm)),
-            ports: Some(vec![port("kdc-tcp", KDC_PORT, "TCP"), port("kdc-udp", KDC_PORT, "UDP"), port("kadmin", KADMIN_PORT, "TCP")]),
+            ports: Some(vec![
+                port("kdc-tcp", KDC_PORT, "TCP"),
+                port("kdc-udp", KDC_PORT, "UDP"),
+                port("kadmin", KADMIN_PORT, "TCP"),
+            ]),
             ..Default::default()
         }),
         ..Default::default()
@@ -234,7 +266,8 @@ pub async fn probe(realm_name: &str, kdc: &str) -> Result<(), String> {
     let (realm_name, kdc) = (realm_name.to_string(), kdc.to_string());
     tokio::task::spawn_blocking(move || {
         let client = krb5::KdcClient::new(realm_name.clone(), [kdc]).with_timeout(Duration::from_secs(3));
-        let probe = krb5::Principal::parse(&format!("krb5-operator-probe@{}", realm_name)).map_err(|e| e.to_string())?;
+        let probe =
+            krb5::Principal::parse(&format!("krb5-operator-probe@{}", realm_name)).map_err(|e| e.to_string())?;
         match client.login_with_password(&probe, "not a password") {
             Err(e) if e.kdc_code() == Some(6) => Ok(()),
             Err(e) => Err(format!("KDC did not answer as expected: {}", e)),
@@ -261,20 +294,32 @@ pub async fn reconcile(realm: Arc<KerberosRealm>, ctx: Arc<Context>) -> Result<A
     let name = realm.base_name();
     let pp = PatchParams::apply(MANAGER).force();
 
-    // The master key: created once, never replaced.
-    let secrets: Api<k8s_openapi::api::core::v1::Secret> = Api::namespaced(ctx.client.clone(), &ns);
-    if secrets.get_opt(&name).await?.is_none() {
-        let secret = k8s_openapi::api::core::v1::Secret {
-            metadata: meta(&realm),
-            data: Some(BTreeMap::from([(MASTER_KEY.to_string(), ByteString(new_master_key().into_bytes()))])),
-            ..Default::default()
-        };
-        secrets.create(&Default::default(), &secret).await?;
-        info!("Created the master key for realm {}", realm.spec.realm);
+    // The master key and admin password: created once, never replaced.
+    let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), &ns);
+    match secrets.get_opt(&name).await? {
+        None => {
+            let secret = Secret {
+                metadata: meta(&realm),
+                data: Some(BTreeMap::from([
+                    (MASTER_KEY.to_string(), ByteString(new_secret().into_bytes())),
+                    (ADMIN_PASSWORD.to_string(), ByteString(new_secret().into_bytes())),
+                ])),
+                ..Default::default()
+            };
+            secrets.create(&Default::default(), &secret).await?;
+            info!("Created the master key for realm {}", realm.spec.realm);
+        }
+        Some(s) if !s.data.as_ref().is_some_and(|d| d.contains_key(ADMIN_PASSWORD)) => {
+            let add = json!({ "data": { ADMIN_PASSWORD: ByteString(new_secret().into_bytes()) } });
+            secrets.patch(&name, &PatchParams::default(), &Patch::Merge(&add)).await?;
+        }
+        Some(_) => {}
     }
     Api::<ConfigMap>::namespaced(ctx.client.clone(), &ns).patch(&name, &pp, &Patch::Apply(&config_map(&realm))).await?;
     Api::<Service>::namespaced(ctx.client.clone(), &ns).patch(&name, &pp, &Patch::Apply(&service(&realm))).await?;
-    Api::<StatefulSet>::namespaced(ctx.client.clone(), &ns).patch(&name, &pp, &Patch::Apply(&stateful_set(&realm))).await?;
+    Api::<StatefulSet>::namespaced(ctx.client.clone(), &ns)
+        .patch(&name, &pp, &Patch::Apply(&stateful_set(&realm)))
+        .await?;
 
     let kdc = format!("{}:{}", kdc_host(&realm), KDC_PORT);
     let ready = probe(&realm.spec.realm, &kdc).await;
@@ -293,9 +338,7 @@ pub async fn reconcile(realm: Arc<KerberosRealm>, ctx: Arc<Context>) -> Result<A
         observed_generation: realm.metadata.generation,
     };
     let realms: Api<KerberosRealm> = Api::namespaced(ctx.client.clone(), &ns);
-    realms
-        .patch_status(&realm.name_any(), &PatchParams::default(), &Patch::Merge(json!({ "status": status })))
-        .await?;
+    realms.patch_status(&realm.name_any(), &PatchParams::default(), &Patch::Merge(json!({ "status": status }))).await?;
     Ok(Action::requeue(if ready.is_ok() { Duration::from_secs(300) } else { Duration::from_secs(10) }))
 }
 
@@ -310,7 +353,8 @@ mod tests {
     use crate::crd::KerberosRealmSpec;
 
     fn realm() -> KerberosRealm {
-        let mut r = KerberosRealm::new("corp", KerberosRealmSpec { realm: "CORP.EXAMPLE.COM".into(), ..Default::default() });
+        let mut r =
+            KerberosRealm::new("corp", KerberosRealmSpec { realm: "CORP.EXAMPLE.COM".into(), ..Default::default() });
         r.metadata.namespace = Some("auth".into());
         r.metadata.uid = Some("u-1".into());
         r
@@ -341,6 +385,9 @@ mod tests {
         let env = c.env.as_ref().unwrap();
         let key = env.iter().find(|e| e.name == "KRB5_MASTER_KEY").unwrap();
         assert_eq!(key.value_from.as_ref().unwrap().secret_key_ref.as_ref().unwrap().name, "corp-kdc");
+        assert!(env.iter().any(|e| e.name == "KRB5_ADMIN_PASSWORD"));
+        // kadmind lets the operator's principal extract keys.
+        assert_eq!(config_files(&r)["kadm5.acl"], "krb5-operator/admin@CORP.EXAMPLE.COM xe\n");
         assert_eq!(spec.volume_claim_templates.as_ref().unwrap()[0].metadata.name.as_deref(), Some("data"));
         // Owned by the realm, so deleting it deletes them.
         assert_eq!(sts.metadata.owner_references.as_ref().unwrap()[0].uid, "u-1");
@@ -356,7 +403,7 @@ mod tests {
         assert!(validate(&r).is_ok());
         r.spec.realm = "BAD REALM]".into();
         assert!(validate(&r).is_err());
-        assert_eq!(new_master_key().len(), 48);
-        assert_ne!(new_master_key(), new_master_key());
+        assert_eq!(new_secret().len(), 48);
+        assert_ne!(new_secret(), new_secret());
     }
 }
