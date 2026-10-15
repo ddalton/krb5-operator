@@ -44,6 +44,7 @@ metadata:
   name: hdfs-services
 spec:
   realmRef: corp
+  # realmNamespace: auth    # default: this object's namespace
   principals:
   - nn/namenode-0.namenode.hdfs.svc.cluster.local   # @CORP.EXAMPLE.COM appended
   - hdfs
@@ -55,10 +56,50 @@ spec:
 The operator logs in to kadmind as `krb5-operator/admin`, creates the
 principals that are missing (`addprinc -randkey`) and extracts their current
 keys (`ktadd -norandkey`), so the keytab always follows the KDC and a
-reconcile never changes a key. The Secret is rewritten only when its bytes
-change. `Ready` means every principal got a ticket with its key from the
-keytab. Deleting the object deletes the principals (unless `Retain`) and the
-Secret.
+reconcile never changes a key. The Secret holds the keytab and the realm's
+`krb5.conf` (key `krb5.conf`), so a pod needs only that one mount; it is
+rewritten only when the keys change. `Ready` means every principal got a
+ticket with its key from the keytab. Deleting the object deletes the
+principals (unless `Retain`) and the Secret.
+
+### One realm, many products
+
+A realm can serve `KerberosPrincipal`s in other namespaces (HDFS in `hdfs`,
+Ranger in `ranger`, ...). It serves only its own namespace unless it says
+otherwise:
+
+```yaml
+kind: KerberosRealm
+metadata: { name: corp, namespace: auth }
+spec:
+  realm: CORP.EXAMPLE.COM
+  allowedNamespaces:
+    from: Selector            # Same (default) | All | Selector
+    selector:
+      matchLabels: { kerberos.example.com/realm: corp }
+---
+kind: KerberosPrincipal
+metadata: { name: namenode, namespace: hdfs }
+spec:
+  realmRef: corp
+  realmNamespace: auth
+  principals: [nn/namenode-0.namenode.hdfs.svc.cluster.local]
+```
+
+Whose keys go where:
+
+- **Ownership.** A principal the operator creates is marked in the KDC
+  with its owner, the `<namespace>/<name>` of its `KerberosPrincipal`. Only
+  that object gets its keys, and only that object deletes it. A principal
+  someone else owns, or one created outside the operator, is a `Conflict`:
+  no keys, no Secret.
+- **Reserved principals** are refused (`Invalid`): `krbtgt/*`, `kadmin/*`,
+  `kiprop/*`, `changepw/*`, `K/M`, `WELLKNOWN/*` and the operator's own
+  `krb5-operator*`. Whoever holds the `krbtgt` key can forge any ticket.
+- **Namespaces the realm does not allow** get `NotAllowed`.
+
+These outcomes are the `Ready` condition's `reason`, along with
+`RealmNotReady` and `KeytabRejected`.
 
 ## Install
 

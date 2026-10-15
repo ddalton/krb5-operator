@@ -42,6 +42,33 @@ pub struct KerberosRealmSpec {
     /// Maximum renewable lifetime (default `7d`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_renewable_life: Option<String>,
+    /// Which namespaces' `KerberosPrincipal`s may use this realm (default:
+    /// only its own).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_namespaces: Option<AllowedNamespaces>,
+}
+
+/// Namespaces whose `KerberosPrincipal`s a realm serves, as Gateway API's
+/// `allowedRoutes.namespaces`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AllowedNamespaces {
+    #[serde(default)]
+    pub from: NamespacesFrom,
+    /// With `from: Selector`: the namespaces whose labels match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub enum NamespacesFrom {
+    /// The realm's own namespace (the default).
+    #[default]
+    Same,
+    /// Every namespace.
+    All,
+    /// Namespaces matching `selector`.
+    Selector,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
@@ -104,13 +131,18 @@ pub enum DeletionPolicy {
     status = "KerberosPrincipalStatus",
     shortname = "kprinc",
     printcolumn = r#"{"name":"Realm","type":"string","jsonPath":".spec.realmRef"}"#,
+    printcolumn = r#"{"name":"Realm Namespace","type":"string","jsonPath":".spec.realmNamespace","priority":1}"#,
     printcolumn = r#"{"name":"Ready","type":"string","jsonPath":".status.conditions[?(@.type==\"Ready\")].status"}"#,
     printcolumn = r#"{"name":"Secret","type":"string","jsonPath":".status.secretName"}"#
 )]
 #[serde(rename_all = "camelCase")]
 pub struct KerberosPrincipalSpec {
-    /// The `KerberosRealm` (same namespace) the principals belong to.
+    /// The `KerberosRealm` the principals belong to.
     pub realm_ref: String,
+    /// Its namespace (default: this object's). The realm must allow this
+    /// object's namespace (`allowedNamespaces`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realm_namespace: Option<String>,
     /// Principal names (`nn/host.example.com`): the realm is appended, or,
     /// if given (`...@REALM`), must be the realm's.
     pub principals: Vec<String>,
@@ -150,6 +182,24 @@ pub struct PrincipalStatus {
 impl KerberosPrincipal {
     pub fn secret_name(&self) -> String {
         self.spec.secret_name.clone().unwrap_or_else(|| self.metadata.name.clone().unwrap_or_default())
+    }
+
+    /// The namespace of the realm it refers to.
+    pub fn realm_namespace(&self) -> String {
+        self.spec
+            .realm_namespace
+            .clone()
+            .or_else(|| self.metadata.namespace.clone())
+            .unwrap_or_else(|| "default".into())
+    }
+
+    /// What it is called as the owner of its principals in the KDC.
+    pub fn owner(&self) -> String {
+        format!(
+            "{}/{}",
+            self.metadata.namespace.as_deref().unwrap_or("default"),
+            self.metadata.name.as_deref().unwrap_or("")
+        )
     }
 
     pub fn keytab_key(&self) -> String {

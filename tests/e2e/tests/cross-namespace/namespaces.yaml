@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: krb5-e2e-allowed
+  labels:
+    krb5-e2e/realm: shared
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: krb5-e2e-denied

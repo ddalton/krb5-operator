@@ -29,6 +29,51 @@ spec:
         properties:
           spec:
             properties:
+              allowedNamespaces:
+                description: |-
+                  Which namespaces' `KerberosPrincipal`s may use this realm (default:
+                  only its own).
+                nullable: true
+                properties:
+                  from:
+                    default: Same
+                    enum:
+                    - Same
+                    - All
+                    - Selector
+                    type: string
+                  selector:
+                    description: 'With `from: Selector`: the namespaces whose labels match.'
+                    nullable: true
+                    properties:
+                      matchExpressions:
+                        description: matchExpressions is a list of label selector requirements. The requirements are ANDed.
+                        items:
+                          description: A label selector requirement is a selector that contains values, a key, and an operator that relates the key and values.
+                          properties:
+                            key:
+                              description: key is the label key that the selector applies to.
+                              type: string
+                            operator:
+                              description: operator represents a key's relationship to a set of values. Valid operators are In, NotIn, Exists and DoesNotExist.
+                              type: string
+                            values:
+                              description: values is an array of string values. If the operator is In or NotIn, the values array must be non-empty. If the operator is Exists or DoesNotExist, the values array must be empty. This array is replaced during a strategic merge patch.
+                              items:
+                                type: string
+                              type: array
+                          required:
+                          - key
+                          - operator
+                          type: object
+                        type: array
+                      matchLabels:
+                        additionalProperties:
+                          type: string
+                        description: matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels map is equivalent to an element of matchExpressions, whose key field is "key", the operator is "In", and the values array contains only "value". The requirements are ANDed.
+                        type: object
+                    type: object
+                type: object
               image:
                 description: 'The KDC image (default: the operator''s MIT krb5 image).'
                 nullable: true
@@ -126,6 +171,10 @@ spec:
     - jsonPath: .spec.realmRef
       name: Realm
       type: string
+    - jsonPath: .spec.realmNamespace
+      name: Realm Namespace
+      priority: 1
+      type: string
     - jsonPath: .status.conditions[?(@.type=="Ready")].status
       name: Ready
       type: string
@@ -160,8 +209,14 @@ spec:
                 items:
                   type: string
                 type: array
+              realmNamespace:
+                description: |-
+                  Its namespace (default: this object's). The realm must allow this
+                  object's namespace (`allowedNamespaces`).
+                nullable: true
+                type: string
               realmRef:
-                description: The `KerberosRealm` (same namespace) the principals belong to.
+                description: The `KerberosRealm` the principals belong to.
                 type: string
               secretName:
                 description: 'The Secret to write the keytab to (default: this object''s name).'

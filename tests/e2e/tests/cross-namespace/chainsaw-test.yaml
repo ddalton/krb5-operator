@@ -1,0 +1,159 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/kyverno/chainsaw/v0.2.15/.schemas/json/test-chainsaw-v1alpha1.json
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: cross-namespace
+spec:
+  description: >-
+    A realm serves KerberosPrincipals in the namespaces its allowedNamespaces
+    selects, and their pods log in with nothing but the Secret; a namespace
+    it does not select is NotAllowed; a principal another object owns is a
+    Conflict; the KDC's own principals are refused.
+  steps:
+  - name: realm-and-namespaces
+    try:
+    - apply:
+        file: namespaces.yaml
+    - apply:
+        file: realm.yaml
+    - assert:
+        resource:
+          apiVersion: krb5.ddalton.dev/v1alpha1
+          kind: KerberosRealm
+          metadata:
+            name: shared
+          status:
+            (conditions[?type == 'Ready']):
+            - status: "True"
+  - name: principals
+    try:
+    # realmNamespace is the test's own namespace, known only at run time.
+    - script:
+        content: |
+          set -eu
+          principal() {  # namespace name principal
+          cat <<YAML | kubectl apply -f -
+          apiVersion: krb5.ddalton.dev/v1alpha1
+          kind: KerberosPrincipal
+          metadata:
+            name: $2
+            namespace: $1
+          spec:
+            realmRef: shared
+            realmNamespace: $NAMESPACE
+            principals: [$3]
+          YAML
+          }
+          principal krb5-e2e-allowed app app/app.example.com
+          principal krb5-e2e-denied intruder svc/denied.example.com
+          principal krb5-e2e-allowed golden krbtgt/SHARED.TEST
+    - assert:
+        resource:
+          apiVersion: krb5.ddalton.dev/v1alpha1
+          kind: KerberosPrincipal
+          metadata:
+            name: app
+            namespace: krb5-e2e-allowed
+          status:
+            secretName: app
+            (conditions[?type == 'Ready']):
+            - status: "True"
+    - assert:
+        resource:
+          apiVersion: krb5.ddalton.dev/v1alpha1
+          kind: KerberosPrincipal
+          metadata:
+            name: intruder
+            namespace: krb5-e2e-denied
+          status:
+            (conditions[?type == 'Ready']):
+            - status: "False"
+              reason: NotAllowed
+    - assert:
+        resource:
+          apiVersion: krb5.ddalton.dev/v1alpha1
+          kind: KerberosPrincipal
+          metadata:
+            name: golden
+            namespace: krb5-e2e-allowed
+          status:
+            (conditions[?type == 'Ready']):
+            - status: "False"
+              reason: Invalid
+    - error:
+        resource:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: intruder
+            namespace: krb5-e2e-denied
+    - error:
+        resource:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: golden
+            namespace: krb5-e2e-allowed
+  - name: login-with-the-secret-alone
+    try:
+    - apply:
+        file: kinit.yaml
+    - assert:
+        resource:
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: kinit
+            namespace: krb5-e2e-allowed
+          status:
+            succeeded: 1
+    catch:
+    - podLogs:
+        namespace: krb5-e2e-allowed
+        selector: job-name=kinit
+  - name: another-owner-is-a-conflict
+    try:
+    - script:
+        content: |
+          set -eu
+          cat <<YAML | kubectl apply -f -
+          apiVersion: krb5.ddalton.dev/v1alpha1
+          kind: KerberosPrincipal
+          metadata:
+            name: thief
+            namespace: krb5-e2e-allowed
+          spec:
+            realmRef: shared
+            realmNamespace: $NAMESPACE
+            principals: [app/app.example.com]
+            secretName: stolen
+          YAML
+    - assert:
+        resource:
+          apiVersion: krb5.ddalton.dev/v1alpha1
+          kind: KerberosPrincipal
+          metadata:
+            name: thief
+            namespace: krb5-e2e-allowed
+          status:
+            (conditions[?type == 'Ready']):
+            - status: "False"
+              reason: Conflict
+    - error:
+        resource:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: stolen
+            namespace: krb5-e2e-allowed
+    # Deleting the thief leaves the owner's principal alone.
+    - script:
+        content: |
+          set -eux
+          kubectl -n krb5-e2e-allowed delete kerberosprincipal thief --wait --timeout=60s
+          kubectl -n "$NAMESPACE" exec shared-kdc-0 -- kadmin.local -r SHARED.TEST -q 'getprinc app/app.example.com' | grep -q '^Principal: app/app.example.com@SHARED.TEST'
+    finally:
+    - script:
+        content: |
+          kubectl delete kerberosprincipal --all -n krb5-e2e-allowed --wait --timeout=60s || true
+          kubectl delete kerberosprincipal --all -n krb5-e2e-denied --wait --timeout=60s || true
