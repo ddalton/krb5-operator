@@ -43,6 +43,10 @@ rules:
   - apiGroups: [apps]
     resources: [statefulsets]
     verbs: [get, list, watch, create, patch, update]
+  # A realm's allowedNamespaces selector matches namespace labels.
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [get]
 ---
 # Source: krb5-operator/templates/rbac.yaml
 apiVersion: rbac.authorization.k8s.io/v1

@@ -17,13 +17,28 @@
 //! A finalizer deletes the principals from the KDC when the object goes
 //! (`deletionPolicy: Retain` keeps them); the Secret is owned by the object
 //! and goes with it.
+//!
+//! Whose keys go where:
+//! - the KDC's, kadmind's and the operator's own principals (`krbtgt/*`,
+//!   `kadmin/*`, `K/M`, `krb5-operator*`, ...) are never served;
+//! - a principal the operator creates is marked, in the KDC, with its
+//!   owner (`<namespace>/<name>` of the object, the string attribute
+//!   `krb5-operator/owner`); only that object gets its keys or deletes it.
+//!   A principal that exists without that mark, or with another owner's, is
+//!   a `Conflict`;
+//! - a realm serves objects in its own namespace, and others only as its
+//!   `allowedNamespaces` says (`NotAllowed` otherwise).
+//!
+//! The Secret also holds the realm's `krb5.conf` (key `krb5.conf`): a pod in
+//! another namespace cannot mount the realm's ConfigMap.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use k8s_openapi::ByteString;
-use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::api::core::v1::{Namespace, Secret};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use krb5::kadmin::{AdminClient, PrincipalChanges};
 use krb5::{EncType, KdcClient, Keytab, Principal, ServiceKey};
@@ -35,7 +50,8 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::crd::{
-    Condition, DeletionPolicy, KerberosPrincipal, KerberosPrincipalStatus, KerberosRealm, PrincipalStatus,
+    Condition, DeletionPolicy, KerberosPrincipal, KerberosPrincipalStatus, KerberosRealm, NamespacesFrom,
+    PrincipalStatus,
 };
 use crate::realm;
 
@@ -43,6 +59,10 @@ const MANAGER: &str = "krb5-operator";
 const FINALIZER: &str = "krb5.ddalton.dev/principals";
 /// The Secret's annotation with [`fingerprint`] of the keys in its keytab.
 const KEYS_SHA256: &str = "krb5.ddalton.dev/keys-sha256";
+/// The string attribute naming a principal's owner in the KDC.
+pub const OWNER_ATTR: &str = "krb5-operator/owner";
+/// The Secret's key for the realm's client configuration.
+pub const KRB5_CONF_KEY: &str = "krb5.conf";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -56,6 +76,24 @@ pub enum Error {
     Kadmin(String),
     #[error("finalizer: {0}")]
     Finalizer(String),
+    #[error("{0}")]
+    Conflict(String),
+    #[error("{0}")]
+    NotAllowed(String),
+}
+
+impl Error {
+    /// For a condition: what is wrong with the object, not with the
+    /// operator or the cluster.
+    fn reason(&self) -> Option<&'static str> {
+        match self {
+            Error::Invalid(_) => Some("Invalid"),
+            Error::Conflict(_) => Some("Conflict"),
+            Error::NotAllowed(_) => Some("NotAllowed"),
+            Error::RealmNotReady(..) => Some("RealmNotReady"),
+            _ => None,
+        }
+    }
 }
 
 pub struct Context {
@@ -81,9 +119,50 @@ pub fn principals(names: &[String], realm: &str) -> Result<Vec<Principal>, Error
             if p.components.is_empty() || p.components.iter().any(|c| c.is_empty()) {
                 return Err(Error::Invalid(format!("{n:?}: empty name component")));
             }
+            if reserved(&p) {
+                return Err(Error::Invalid(format!("{n:?} is reserved for the KDC, kadmind or the operator")));
+            }
             Ok(p)
         })
         .collect()
+}
+
+/// The KDC's, kadmind's and the operator's own principals: whoever has
+/// their keys has the realm (a `krbtgt` key forges any ticket).
+pub fn reserved(p: &Principal) -> bool {
+    let first = p.components[0].as_str();
+    matches!(first, "krbtgt" | "kadmin" | "kiprop" | "changepw" | "WELLKNOWN" | "K")
+        || first.starts_with("krb5-operator")
+}
+
+/// Whether `realm` serves `KerberosPrincipal`s in namespace `ns` (whose
+/// labels are `labels`).
+pub fn allowed(realm: &KerberosRealm, ns: &str, labels: &BTreeMap<String, String>) -> bool {
+    if realm.metadata.namespace.as_deref().unwrap_or("default") == ns {
+        return true;
+    }
+    let Some(a) = &realm.spec.allowed_namespaces else { return false };
+    match a.from {
+        NamespacesFrom::Same => false,
+        NamespacesFrom::All => true,
+        NamespacesFrom::Selector => a.selector.as_ref().is_some_and(|s| selects(s, labels)),
+    }
+}
+
+/// A label selector's meaning (an empty selector selects everything).
+pub fn selects(s: &LabelSelector, labels: &BTreeMap<String, String>) -> bool {
+    let exact = s.match_labels.iter().flatten().all(|(k, v)| labels.get(k) == Some(v));
+    let exprs = s.match_expressions.iter().flatten().all(|e| {
+        let values = e.values.as_deref().unwrap_or_default();
+        match e.operator.as_str() {
+            "In" => labels.get(&e.key).is_some_and(|v| values.contains(v)),
+            "NotIn" => labels.get(&e.key).is_none_or(|v| !values.contains(v)),
+            "Exists" => labels.contains_key(&e.key),
+            "DoesNotExist" => !labels.contains_key(&e.key),
+            _ => false,
+        }
+    });
+    exact && exprs
 }
 
 /// The keytab for `keys` (each principal's, with their kvnos), as MIT's
@@ -147,35 +226,62 @@ impl Admin {
             .map_err(|e| Error::Kadmin(format!("logging in as {}: {e}", realm::ADMIN)))
     }
 
-    /// Create what is missing, then every principal's current keys.
-    pub fn ensure(&self, ps: &[Principal]) -> Result<Vec<PrincipalKeys>, Error> {
+    /// Create what is missing, owned by `owner`, then every principal's
+    /// current keys; a principal someone else owns is a [`Error::Conflict`].
+    pub fn ensure(&self, ps: &[Principal], owner: &str) -> Result<Vec<PrincipalKeys>, Error> {
         let mut kadm = self.connect()?;
         let mut out = Vec::with_capacity(ps.len());
         for p in ps {
-            let keys = match kadm.extract_keys(p, None) {
-                Err(e) if e.code().is_some_and(|c| c.is_unknown_principal()) => {
-                    kadm.create_principal(p, &PrincipalChanges::default(), None)
-                        .map_err(|e| Error::Kadmin(format!("creating {}: {e}", p.name())))?;
-                    info!("Created principal {}@{}", p.name(), p.realm);
-                    kadm.extract_keys(p, None)
+            match owner_of(&mut kadm, p)? {
+                Some(Some(o)) if o == owner => {}
+                Some(Some(o)) => {
+                    return Err(Error::Conflict(format!("{}@{} belongs to {o}", p.name(), p.realm)));
                 }
-                r => r,
+                Some(None) => {
+                    return Err(Error::Conflict(format!(
+                        "{}@{} exists and was not made by the operator",
+                        p.name(),
+                        p.realm
+                    )));
+                }
+                None => {
+                    kadm.create_principal(p, &PrincipalChanges::default(), None).map_err(|e| match e.code() {
+                        // Made since we looked: someone else's.
+                        Some(c) if c.name() == Some("KADM5_DUP") => {
+                            Error::Conflict(format!("{}@{} was just created by someone else", p.name(), p.realm))
+                        }
+                        _ => Error::Kadmin(format!("creating {}: {e}", p.name())),
+                    })?;
+                    if let Err(e) = kadm.set_string(p, OWNER_ATTR, Some(owner)) {
+                        // Unmarked, it would be nobody's: take it back.
+                        let _ = kadm.delete_principal(p);
+                        return Err(Error::Kadmin(format!("marking {} as {owner}'s: {e}", p.name())));
+                    }
+                    info!("Created principal {}@{} for {owner}", p.name(), p.realm);
+                }
             }
-            .map_err(|e| Error::Kadmin(format!("extracting keys of {}: {e}", p.name())))?;
+            let keys = kadm
+                .extract_keys(p, None)
+                .map_err(|e| Error::Kadmin(format!("extracting keys of {}: {e}", p.name())))?;
             out.push((p.clone(), keys));
         }
         kadm.close();
         Ok(out)
     }
 
-    /// Delete the principals (those already gone are fine).
-    pub fn delete(&self, ps: &[Principal]) -> Result<(), Error> {
+    /// Delete the principals `owner` owns (those gone, or someone else's,
+    /// are left alone).
+    pub fn delete(&self, ps: &[Principal], owner: &str) -> Result<(), Error> {
         let mut kadm = self.connect()?;
         for p in ps {
-            match kadm.delete_principal(p) {
-                Ok(()) => info!("Deleted principal {}@{}", p.name(), p.realm),
-                Err(e) if e.code().is_some_and(|c| c.is_unknown_principal()) => {}
-                Err(e) => return Err(Error::Kadmin(format!("deleting {}: {e}", p.name()))),
+            match owner_of(&mut kadm, p)? {
+                Some(Some(o)) if o == owner => match kadm.delete_principal(p) {
+                    Ok(()) => info!("Deleted principal {}@{} of {owner}", p.name(), p.realm),
+                    Err(e) if e.code().is_some_and(|c| c.is_unknown_principal()) => {}
+                    Err(e) => return Err(Error::Kadmin(format!("deleting {}: {e}", p.name()))),
+                },
+                None => {}
+                Some(o) => info!("Not deleting {}@{}: not {owner}'s ({o:?})", p.name(), p.realm),
             }
         }
         kadm.close();
@@ -192,22 +298,57 @@ impl Admin {
     }
 }
 
-/// The realm `kp` refers to, ready, and how to administer it.
-async fn admin_for(client: &Client, kp: &KerberosPrincipal) -> Result<(KerberosRealm, Admin), Error> {
-    let ns = kp.namespace().unwrap_or_else(|| "default".into());
-    let r = Api::<KerberosRealm>::namespaced(client.clone(), &ns)
+/// Whose `p` is: `None` if it does not exist, `Some(None)` if it has no
+/// owner mark.
+fn owner_of(kadm: &mut AdminClient, p: &Principal) -> Result<Option<Option<String>>, Error> {
+    match kadm.get_strings(p) {
+        Ok(strings) => Ok(Some(strings.into_iter().find(|(k, _)| k == OWNER_ATTR).map(|(_, v)| v))),
+        Err(e) if e.code().is_some_and(|c| c.is_unknown_principal()) => Ok(None),
+        Err(e) => Err(Error::Kadmin(format!("reading {}: {e}", p.name()))),
+    }
+}
+
+/// `namespace/name` of the realm `kp` refers to.
+fn realm_ref(kp: &KerberosPrincipal) -> String {
+    format!("{}/{}", kp.realm_namespace(), kp.spec.realm_ref)
+}
+
+/// The realm `kp` refers to, ready (and, with `check_allowed`, serving
+/// `kp`'s namespace), and how to administer it.
+async fn admin_for(
+    client: &Client,
+    kp: &KerberosPrincipal,
+    check_allowed: bool,
+) -> Result<(KerberosRealm, Admin), Error> {
+    let r = Api::<KerberosRealm>::namespaced(client.clone(), &kp.realm_namespace())
         .get_opt(&kp.spec.realm_ref)
         .await?
-        .ok_or_else(|| Error::RealmNotReady(kp.spec.realm_ref.clone(), "no such KerberosRealm".into()))?;
+        .ok_or_else(|| Error::RealmNotReady(realm_ref(kp), "no such KerberosRealm".into()))?;
+    if check_allowed {
+        let ns = kp.namespace().unwrap_or_else(|| "default".into());
+        let needs_labels = r.metadata.namespace.as_deref() != Some(&ns)
+            && r.spec.allowed_namespaces.as_ref().is_some_and(|a| a.from == NamespacesFrom::Selector);
+        let labels = if needs_labels {
+            Api::<Namespace>::all(client.clone()).get_opt(&ns).await?.map(|n| n.labels().clone()).unwrap_or_default()
+        } else {
+            BTreeMap::new()
+        };
+        if !allowed(&r, &ns, &labels) {
+            return Err(Error::NotAllowed(format!(
+                "realm {} does not serve namespace {ns} (its spec.allowedNamespaces)",
+                realm_ref(kp)
+            )));
+        }
+    }
     let status = r.status.clone().unwrap_or_default();
     let ready = status.conditions.iter().any(|c| c.type_ == "Ready" && c.status == "True");
     let (Some(kdc), Some(admin_server), true) = (status.kdc, status.admin_server, ready) else {
-        return Err(Error::RealmNotReady(kp.spec.realm_ref.clone(), "its KDC does not answer yet".into()));
+        return Err(Error::RealmNotReady(realm_ref(kp), "its KDC does not answer yet".into()));
     };
     let password = realm::admin_password(client, &r)
         .await
-        .map_err(|e| Error::RealmNotReady(kp.spec.realm_ref.clone(), e.to_string()))?
-        .ok_or_else(|| Error::RealmNotReady(kp.spec.realm_ref.clone(), "no admin password".into()))?;
+        .map_err(|e| Error::RealmNotReady(realm_ref(kp), e.to_string()))?
+        .ok_or_else(|| Error::RealmNotReady(realm_ref(kp), "no admin password".into()))?;
     let realm = r.spec.realm.clone();
     Ok((r, Admin { realm, kdc, admin_server, password }))
 }
@@ -216,7 +357,7 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
     tokio::task::spawn_blocking(f).await.map_err(|e| Error::Kadmin(e.to_string()))
 }
 
-pub fn secret(kp: &KerberosPrincipal, keytab: Vec<u8>, fingerprint: &str) -> Secret {
+pub fn secret(kp: &KerberosPrincipal, keytab: Vec<u8>, fingerprint: &str, krb5_conf: &str) -> Secret {
     Secret {
         metadata: ObjectMeta {
             name: Some(kp.secret_name()),
@@ -230,7 +371,10 @@ pub fn secret(kp: &KerberosPrincipal, keytab: Vec<u8>, fingerprint: &str) -> Sec
             ..Default::default()
         },
         type_: Some("Opaque".into()),
-        data: Some(BTreeMap::from([(kp.keytab_key(), ByteString(keytab))])),
+        data: Some(BTreeMap::from([
+            (kp.keytab_key(), ByteString(keytab)),
+            (KRB5_CONF_KEY.to_string(), ByteString(krb5_conf.as_bytes().to_vec())),
+        ])),
         ..Default::default()
     }
 }
@@ -254,23 +398,32 @@ async fn set_status(client: &Client, kp: &KerberosPrincipal, status: KerberosPri
 }
 
 async fn apply(kp: Arc<KerberosPrincipal>, client: &Client) -> Result<Action, Error> {
-    let (_, admin) = match admin_for(client, &kp).await {
-        Ok(a) => a,
-        Err(e @ Error::RealmNotReady(..)) => {
+    match sync(&kp, client).await {
+        // What is wrong with the object (or its realm) goes in its status.
+        Err(e) if e.reason().is_some() => {
+            let reason = e.reason().unwrap_or_default();
+            if reason != "RealmNotReady" {
+                warn!("{}: {}", kp.name_any(), e);
+            }
             let status = KerberosPrincipalStatus {
-                conditions: vec![condition(false, "RealmNotReady", &e.to_string())],
+                conditions: vec![condition(false, reason, &e.to_string())],
                 observed_generation: kp.metadata.generation,
                 ..Default::default()
             };
             set_status(client, &kp, status).await?;
-            return Ok(Action::requeue(Duration::from_secs(10)));
+            Ok(Action::requeue(Duration::from_secs(if reason == "RealmNotReady" { 10 } else { 60 })))
         }
-        Err(e) => return Err(e),
-    };
+        r => r,
+    }
+}
+
+async fn sync(kp: &KerberosPrincipal, client: &Client) -> Result<Action, Error> {
+    let (realm, admin) = admin_for(client, kp, true).await?;
+    let krb5_conf = realm::config_files(&realm).remove(KRB5_CONF_KEY).unwrap_or_default();
     let ps = principals(&kp.spec.principals, &admin.realm)?;
     let keys = {
-        let (admin, ps) = (admin.clone(), ps.clone());
-        blocking(move || admin.ensure(&ps)).await??
+        let (admin, ps, owner) = (admin.clone(), ps.clone(), kp.owner());
+        blocking(move || admin.ensure(&ps, &owner)).await??
     };
     let kt = keytab(&keys);
     let fp = fingerprint(&keys);
@@ -281,10 +434,13 @@ async fn apply(kp: Arc<KerberosPrincipal>, client: &Client) -> Result<Action, Er
     let current = secrets.get_opt(&name).await?;
     let unchanged = current.as_ref().is_some_and(|s| {
         s.annotations().get(KEYS_SHA256) == Some(&fp)
-            && s.data.as_ref().is_some_and(|d| d.get(&kp.keytab_key()).is_some_and(|b| !b.0.is_empty()))
+            && s.data.as_ref().is_some_and(|d| {
+                d.get(&kp.keytab_key()).is_some_and(|b| !b.0.is_empty())
+                    && d.get(KRB5_CONF_KEY).is_some_and(|b| b.0 == krb5_conf.as_bytes())
+            })
     });
     if !unchanged {
-        let s = secret(&kp, kt.to_bytes(), &fp);
+        let s = secret(kp, kt.to_bytes(), &fp, &krb5_conf);
         secrets.patch(&name, &PatchParams::apply(MANAGER).force(), &Patch::Apply(&s)).await?;
         info!("Wrote the keytab of {} to Secret {}/{}", kp.name_any(), ns, name);
     }
@@ -312,7 +468,7 @@ async fn apply(kp: Arc<KerberosPrincipal>, client: &Client) -> Result<Action, Er
         conditions: vec![cond],
         observed_generation: kp.metadata.generation,
     };
-    set_status(client, &kp, status).await?;
+    set_status(client, kp, status).await?;
     Ok(Action::requeue(if verified.is_ok() { Duration::from_secs(300) } else { Duration::from_secs(30) }))
 }
 
@@ -320,20 +476,24 @@ async fn cleanup(kp: Arc<KerberosPrincipal>, client: &Client) -> Result<Action, 
     if kp.spec.deletion_policy == DeletionPolicy::Retain {
         return Ok(Action::await_change());
     }
-    let admin = match admin_for(client, &kp).await {
+    // Its own principals go whether or not the realm still serves its
+    // namespace.
+    let admin = match admin_for(client, &kp, false).await {
         Ok((_, admin)) => admin,
         // The realm is gone (and its KDC with it): nothing to delete.
-        Err(Error::RealmNotReady(r, why)) => {
-            let ns = kp.namespace().unwrap_or_else(|| "default".into());
-            if Api::<KerberosRealm>::namespaced(client.clone(), &ns).get_opt(&r).await?.is_none() {
+        Err(e @ Error::RealmNotReady(..)) => {
+            let realms = Api::<KerberosRealm>::namespaced(client.clone(), &kp.realm_namespace());
+            if realms.get_opt(&kp.spec.realm_ref).await?.is_none() {
                 return Ok(Action::await_change());
             }
-            return Err(Error::RealmNotReady(r, why));
+            return Err(e);
         }
         Err(e) => return Err(e),
     };
-    let ps = principals(&kp.spec.principals, &admin.realm)?;
-    blocking(move || admin.delete(&ps)).await??;
+    // Names that are not valid (or reserved) were never created.
+    let Ok(ps) = principals(&kp.spec.principals, &admin.realm) else { return Ok(Action::await_change()) };
+    let owner = kp.owner();
+    blocking(move || admin.delete(&ps, &owner)).await??;
     Ok(Action::await_change())
 }
 
@@ -362,7 +522,108 @@ pub fn error_policy(kp: Arc<KerberosPrincipal>, e: &Error, _: Arc<Context>) -> A
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crd::KerberosPrincipalSpec;
+    use crate::crd::{AllowedNamespaces, KerberosPrincipalSpec, KerberosRealmSpec};
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelectorRequirement;
+
+    const ME: &str = "tests/me";
+
+    #[test]
+    fn the_kdcs_and_the_operators_principals_are_never_served() {
+        for n in [
+            "krbtgt/CORP.TEST",
+            "krbtgt/OTHER.TEST@CORP.TEST",
+            "kadmin/admin",
+            "kadmin/changepw",
+            "kiprop/kdc.example.com",
+            "K/M",
+            "WELLKNOWN/ANONYMOUS",
+            "krb5-operator/admin",
+            "krb5-operator-probe",
+            "changepw/kerberos",
+        ] {
+            assert!(matches!(principals(&[n.into()], "CORP.TEST"), Err(Error::Invalid(_))), "{n}");
+        }
+        // Lookalikes are fine.
+        assert!(principals(&["kadminx".into(), "admin/admin".into(), "Krbtgt".into()], "CORP.TEST").is_ok());
+    }
+
+    fn realm_in(ns: &str, allowed: Option<AllowedNamespaces>) -> KerberosRealm {
+        let mut r = KerberosRealm::new(
+            "corp",
+            KerberosRealmSpec { realm: "CORP.TEST".into(), allowed_namespaces: allowed, ..Default::default() },
+        );
+        r.metadata.namespace = Some(ns.into());
+        r
+    }
+
+    fn labels(kv: &[(&str, &str)]) -> BTreeMap<String, String> {
+        kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn a_realm_serves_its_namespace_and_those_it_allows() {
+        let none = BTreeMap::new();
+        let own = realm_in("auth", None);
+        assert!(allowed(&own, "auth", &none));
+        assert!(!allowed(&own, "hdfs", &none), "by default only its own");
+        let same = realm_in("auth", Some(AllowedNamespaces { from: NamespacesFrom::Same, selector: None }));
+        assert!(!allowed(&same, "hdfs", &none));
+        let all = realm_in("auth", Some(AllowedNamespaces { from: NamespacesFrom::All, selector: None }));
+        assert!(allowed(&all, "hdfs", &none));
+        let sel = |s: LabelSelector| {
+            realm_in("auth", Some(AllowedNamespaces { from: NamespacesFrom::Selector, selector: Some(s) }))
+        };
+        let by_label = sel(LabelSelector {
+            match_labels: Some(labels(&[("kerberos", "corp")]).into_iter().collect()),
+            ..Default::default()
+        });
+        assert!(allowed(&by_label, "hdfs", &labels(&[("kerberos", "corp"), ("x", "y")])));
+        assert!(!allowed(&by_label, "hdfs", &labels(&[("kerberos", "other")])));
+        assert!(!allowed(&by_label, "hdfs", &none));
+        assert!(allowed(&by_label, "auth", &none), "its own namespace always");
+        // Selector without a selector: nobody else.
+        let empty = realm_in("auth", Some(AllowedNamespaces { from: NamespacesFrom::Selector, selector: None }));
+        assert!(!allowed(&empty, "hdfs", &labels(&[("kerberos", "corp")])));
+    }
+
+    #[test]
+    fn label_selectors_mean_what_kubernetes_means() {
+        let expr = |key: &str, op: &str, values: &[&str]| LabelSelectorRequirement {
+            key: key.into(),
+            operator: op.into(),
+            values: Some(values.iter().map(|v| v.to_string()).collect()),
+        };
+        let sel = |exprs: Vec<LabelSelectorRequirement>| LabelSelector {
+            match_expressions: Some(exprs),
+            ..Default::default()
+        };
+        let l = labels(&[("tier", "data"), ("team", "hdfs")]);
+        assert!(selects(&LabelSelector::default(), &l), "empty selects all");
+        assert!(selects(&sel(vec![expr("tier", "In", &["data", "web"])]), &l));
+        assert!(!selects(&sel(vec![expr("tier", "In", &["web"])]), &l));
+        assert!(selects(&sel(vec![expr("tier", "NotIn", &["web"])]), &l));
+        assert!(selects(&sel(vec![expr("zone", "NotIn", &["a"])]), &l), "NotIn holds without the key");
+        assert!(selects(&sel(vec![expr("team", "Exists", &[])]), &l));
+        assert!(!selects(&sel(vec![expr("zone", "Exists", &[])]), &l));
+        assert!(selects(&sel(vec![expr("zone", "DoesNotExist", &[])]), &l));
+        assert!(!selects(&sel(vec![expr("team", "Exists", &[]), expr("zone", "Exists", &[])]), &l), "all must hold");
+        assert!(!selects(&sel(vec![expr("team", "Bogus", &[])]), &l));
+    }
+
+    #[test]
+    fn principals_find_their_realm_and_name_their_owner() {
+        let mut kp = KerberosPrincipal::new(
+            "nn",
+            KerberosPrincipalSpec { realm_ref: "corp".into(), principals: vec!["nn/x".into()], ..Default::default() },
+        );
+        kp.metadata.namespace = Some("hdfs".into());
+        assert_eq!(kp.realm_namespace(), "hdfs");
+        assert_eq!(kp.owner(), "hdfs/nn");
+        kp.spec.realm_namespace = Some("auth".into());
+        assert_eq!(kp.realm_namespace(), "auth");
+        assert_eq!(realm_ref(&kp), "auth/corp");
+        assert_eq!(kp.owner(), "hdfs/nn", "the owner is where the object is");
+    }
 
     #[test]
     fn principal_names_take_the_realm() {
@@ -407,14 +668,15 @@ mod tests {
         );
         kp.metadata.namespace = Some("hdfs".into());
         kp.metadata.uid = Some("u-2".into());
-        let s = secret(&kp, vec![5, 2], "ab");
+        let s = secret(&kp, vec![5, 2], "ab", "[libdefaults]\n");
         assert_eq!(s.metadata.annotations.as_ref().unwrap()[KEYS_SHA256], "ab");
+        assert_eq!(s.data.as_ref().unwrap()[KRB5_CONF_KEY].0, b"[libdefaults]\n");
         assert_eq!(s.metadata.name.as_deref(), Some("pillar-nn"));
         assert_eq!(s.metadata.owner_references.unwrap()[0].uid, "u-2");
         assert_eq!(s.data.unwrap()["krb5.keytab"].0, vec![5, 2]);
         kp.spec.secret_name = Some("nn-keytab".into());
         kp.spec.keytab_key = Some("nn.keytab".into());
-        let s = secret(&kp, vec![], "ab");
+        let s = secret(&kp, vec![], "ab", "");
         assert_eq!(s.metadata.name.as_deref(), Some("nn-keytab"));
         assert!(s.data.unwrap().contains_key("nn.keytab"));
         assert_eq!(kp.spec.deletion_policy, DeletionPolicy::Delete);
@@ -453,7 +715,7 @@ mod tests {
         let admin = live_or_skip!();
         let names = vec![format!("nn/{}.example.com", unique("host")), unique("svc")];
         let ps = principals(&names, &admin.realm).unwrap();
-        let keys = admin.ensure(&ps).unwrap();
+        let keys = admin.ensure(&ps, ME).unwrap();
         assert_eq!(keys.len(), 2);
         for (_, ks) in &keys {
             assert!(!ks.is_empty(), "the realm's enctypes");
@@ -463,21 +725,21 @@ mod tests {
         admin.verify(&ps, &kt).unwrap();
         // Again: nothing is created and no key changes, so the Secret is
         // left alone.
-        let again = admin.ensure(&ps).unwrap();
+        let again = admin.ensure(&ps, ME).unwrap();
         assert_eq!(fingerprint(&again), fingerprint(&keys));
-        admin.delete(&ps).unwrap();
+        admin.delete(&ps, ME).unwrap();
     }
 
     #[test]
     fn live_a_key_changed_in_the_kdc_reaches_the_keytab() {
         let admin = live_or_skip!();
         let ps = principals(&[unique("rotated")], &admin.realm).unwrap();
-        let first = admin.ensure(&ps).unwrap();
+        let first = admin.ensure(&ps, ME).unwrap();
         let old = keytab(&first);
         let mut kadm = admin.connect().unwrap();
         kadm.randomize_keys(&ps[0]).unwrap();
         kadm.close();
-        let keys = admin.ensure(&ps).unwrap();
+        let keys = admin.ensure(&ps, ME).unwrap();
         let new = keytab(&keys);
         assert!(
             keys[0].1.iter().all(|(v, _)| *v == 2),
@@ -487,18 +749,41 @@ mod tests {
         assert_ne!(fingerprint(&keys), fingerprint(&first));
         admin.verify(&ps, &new).unwrap();
         assert!(admin.verify(&ps, &old).is_err(), "the old keytab no longer works");
-        admin.delete(&ps).unwrap();
+        admin.delete(&ps, ME).unwrap();
     }
 
     #[test]
     fn live_deleting_removes_the_principals_once() {
         let admin = live_or_skip!();
         let ps = principals(&[unique("gone")], &admin.realm).unwrap();
-        let kt = keytab(&admin.ensure(&ps).unwrap());
-        admin.delete(&ps).unwrap();
+        let kt = keytab(&admin.ensure(&ps, ME).unwrap());
+        admin.delete(&ps, ME).unwrap();
         let e = admin.verify(&ps, &kt).unwrap_err();
         assert!(e.contains("6") || e.to_lowercase().contains("unknown"), "{e}");
-        admin.delete(&ps).unwrap(); // already gone: fine
+        admin.delete(&ps, ME).unwrap(); // already gone: fine
+    }
+
+    #[test]
+    fn live_a_principal_belongs_to_the_object_that_made_it() {
+        let admin = live_or_skip!();
+        let ps = principals(&[unique("owned")], &admin.realm).unwrap();
+        let mine = keytab(&admin.ensure(&ps, ME).unwrap());
+        // Another object naming it gets neither its keys nor its deletion.
+        let theirs = admin.ensure(&ps, "elsewhere/thief");
+        assert!(matches!(&theirs, Err(Error::Conflict(m)) if m.contains(ME)), "{theirs:?}");
+        admin.delete(&ps, "elsewhere/thief").unwrap();
+        admin.verify(&ps, &mine).unwrap();
+        // A principal made outside the operator is nobody's to take.
+        let outside = principals(&[unique("outside")], &admin.realm).unwrap();
+        let mut kadm = admin.connect().unwrap();
+        kadm.create_principal(&outside[0], &PrincipalChanges::default(), None).unwrap();
+        let r = admin.ensure(&outside, ME);
+        assert!(matches!(&r, Err(Error::Conflict(m)) if m.contains("not made by the operator")), "{r:?}");
+        admin.delete(&outside, ME).unwrap();
+        assert!(kadm.get_principal(&outside[0]).is_ok(), "left alone");
+        kadm.delete_principal(&outside[0]).unwrap();
+        kadm.close();
+        admin.delete(&ps, ME).unwrap();
     }
 
     #[test]
@@ -506,6 +791,6 @@ mod tests {
         let mut admin = live_or_skip!();
         admin.password = "wrong".into();
         let ps = principals(&[unique("never")], &admin.realm).unwrap();
-        assert!(matches!(admin.ensure(&ps), Err(Error::Kadmin(_))));
+        assert!(matches!(admin.ensure(&ps, ME), Err(Error::Kadmin(_))));
     }
 }

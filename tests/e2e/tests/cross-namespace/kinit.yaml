@@ -1,0 +1,33 @@
+# In the allowed namespace, with nothing but the Secret: its keytab and the
+# realm's krb5.conf (the realm's ConfigMap is in another namespace).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kinit
+  namespace: krb5-e2e-allowed
+spec:
+  backoffLimit: 6
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: kinit
+        image: krb5-kdc:e2e
+        imagePullPolicy: Never
+        command: [sh, -euxc]
+        args:
+        - |
+          kinit -k -t /krb5/krb5.keytab app/app.example.com
+          kvno app/app.example.com
+        env:
+        - name: KRB5_CONFIG
+          value: /krb5/krb5.conf
+        - name: KRB5CCNAME
+          value: FILE:/tmp/cc
+        volumeMounts:
+        - name: krb5
+          mountPath: /krb5
+      volumes:
+      - name: krb5
+        secret:
+          secretName: app

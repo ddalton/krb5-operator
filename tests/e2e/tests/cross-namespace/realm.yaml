@@ -1,0 +1,13 @@
+# Serves its own namespace and those labelled krb5-e2e/realm=shared.
+apiVersion: krb5.ddalton.dev/v1alpha1
+kind: KerberosRealm
+metadata:
+  name: shared
+spec:
+  realm: SHARED.TEST
+  storage: 100Mi
+  allowedNamespaces:
+    from: Selector
+    selector:
+      matchLabels:
+        krb5-e2e/realm: shared
