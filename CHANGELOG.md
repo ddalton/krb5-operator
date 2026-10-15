@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- krb5 0.12. Keytab logins (verifying a keytab) use SPAKE when the KDC
+  offers it.
+
 ## 0.3.0 — 2026-10-15
 
 - `KerberosNodeKeytab` (cluster-scoped): `host/` and `nfs/` principals for
