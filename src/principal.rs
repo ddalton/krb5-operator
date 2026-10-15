@@ -31,12 +31,18 @@
 //!
 //! The Secret also holds the realm's `krb5.conf` (key `krb5.conf`): a pod in
 //! another namespace cannot mount the realm's ConfigMap.
+//!
+//! Host principals (`hostPrincipals`) follow a StatefulSet's `replicas`
+//! (its desired count, so the keys are there before the pods): scaling up
+//! adds principals, and principals no longer wanted, by a scale-down or a
+//! spec change, are deleted from the KDC (`Retain` keeps them).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use k8s_openapi::ByteString;
+use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::{Namespace, Secret};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -50,8 +56,8 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::crd::{
-    Condition, DeletionPolicy, KerberosPrincipal, KerberosPrincipalStatus, KerberosRealm, NamespacesFrom,
-    PrincipalStatus,
+    Condition, DeletionPolicy, HostPrincipals, KerberosPrincipal, KerberosPrincipalStatus, KerberosRealm,
+    NamespacesFrom, PrincipalStatus,
 };
 use crate::realm;
 
@@ -80,6 +86,8 @@ pub enum Error {
     Conflict(String),
     #[error("{0}")]
     NotAllowed(String),
+    #[error("{0}")]
+    StatefulSetNotFound(String),
 }
 
 impl Error {
@@ -91,6 +99,7 @@ impl Error {
             Error::Conflict(_) => Some("Conflict"),
             Error::NotAllowed(_) => Some("NotAllowed"),
             Error::RealmNotReady(..) => Some("RealmNotReady"),
+            Error::StatefulSetNotFound(_) => Some("StatefulSetNotFound"),
             _ => None,
         }
     }
@@ -98,6 +107,9 @@ impl Error {
 
 pub struct Context {
     pub client: Client,
+    /// The cluster's DNS domain, for pods' names (`CLUSTER_DOMAIN`,
+    /// default `cluster.local`).
+    pub cluster_domain: String,
 }
 
 /// A principal and its keys, with their kvnos.
@@ -124,6 +136,107 @@ pub fn principals(names: &[String], realm: &str) -> Result<Vec<Principal>, Error
             }
             Ok(p)
         })
+        .collect()
+}
+
+/// A principal to serve, and the pod it is for (host principals).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Wanted {
+    pub principal: Principal,
+    pub pod: Option<String>,
+}
+
+/// `<service>/<pod FQDN>` for every service and every pod `sts` wants
+/// (its `replicas`), in namespace `ns` of cluster domain `domain`.
+pub fn host_principals(
+    hp: &HostPrincipals,
+    sts: &StatefulSet,
+    ns: &str,
+    domain: &str,
+    realm: &str,
+) -> Result<Vec<Wanted>, Error> {
+    let spec = sts.spec.as_ref();
+    let service = spec.and_then(|s| s.service_name.as_deref()).filter(|s| !s.is_empty()).ok_or_else(|| {
+        Error::Invalid(format!("StatefulSet {} has no serviceName, so its pods have no DNS names", hp.stateful_set))
+    })?;
+    if hp.services.is_empty() {
+        return Err(Error::Invalid("hostPrincipals.services is empty".into()));
+    }
+    let replicas = spec.and_then(|s| s.replicas).unwrap_or(1).max(0);
+    let mut out = Vec::with_capacity(replicas as usize * hp.services.len());
+    for i in 0..replicas {
+        let pod = format!("{}-{i}", sts.name_any());
+        let fqdn = format!("{pod}.{service}.{ns}.svc.{domain}");
+        for svc in &hp.services {
+            if svc.is_empty() || svc.contains(['/', '@']) {
+                return Err(Error::Invalid(format!("host principal service {svc:?}: a name, no '/' or '@'")));
+            }
+            let principal = principals(&[format!("{svc}/{fqdn}")], realm)?.remove(0);
+            out.push(Wanted { principal, pod: Some(pod.clone()) });
+        }
+    }
+    Ok(out)
+}
+
+/// Everything `kp` wants: its `principals`, then its host principals
+/// (`sts` is its StatefulSet), each once.
+pub fn wanted(
+    kp: &KerberosPrincipal,
+    sts: Option<&StatefulSet>,
+    domain: &str,
+    realm: &str,
+) -> Result<Vec<Wanted>, Error> {
+    let mut out: Vec<Wanted> = if kp.spec.principals.is_empty() {
+        Vec::new()
+    } else {
+        principals(&kp.spec.principals, realm)?.into_iter().map(|principal| Wanted { principal, pod: None }).collect()
+    };
+    if let (Some(hp), Some(sts)) = (&kp.spec.host_principals, sts) {
+        let ns = kp.namespace().unwrap_or_else(|| "default".into());
+        for w in host_principals(hp, sts, &ns, domain, realm)? {
+            if !out.iter().any(|o| o.principal == w.principal) {
+                out.push(w);
+            }
+        }
+    }
+    if out.is_empty() && kp.spec.host_principals.is_none() {
+        return Err(Error::Invalid("no principals".into()));
+    }
+    Ok(out)
+}
+
+/// The Secret's files: every key in `keytab_key`, each pod's own in
+/// `<pod>.keytab`, and the realm's `krb5.conf`.
+pub fn secret_files(
+    wanted: &[Wanted],
+    keys: &[PrincipalKeys],
+    keytab_key: &str,
+    krb5_conf: &str,
+) -> BTreeMap<String, Vec<u8>> {
+    let mut files = BTreeMap::from([
+        (keytab_key.to_string(), keytab(keys).to_bytes()),
+        (KRB5_CONF_KEY.to_string(), krb5_conf.as_bytes().to_vec()),
+    ]);
+    let mut pods: BTreeMap<&str, Vec<PrincipalKeys>> = BTreeMap::new();
+    for (w, k) in wanted.iter().zip(keys) {
+        if let Some(pod) = &w.pod {
+            pods.entry(pod).or_default().push(k.clone());
+        }
+    }
+    for (pod, ks) in pods {
+        files.entry(format!("{pod}.keytab")).or_insert_with(|| keytab(&ks).to_bytes());
+    }
+    files
+}
+
+/// Principals `kp` had (its status) that it no longer wants.
+pub fn unwanted(kp: &KerberosPrincipal, wanted: &[Wanted]) -> Vec<Principal> {
+    let names: Vec<String> = wanted.iter().map(|w| format!("{}@{}", w.principal.name(), w.principal.realm)).collect();
+    kp.status
+        .iter()
+        .flat_map(|s| &s.principals)
+        .filter(|p| !names.contains(&p.name))
+        .filter_map(|p| Principal::parse(&p.name).ok())
         .collect()
 }
 
@@ -357,7 +470,7 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
     tokio::task::spawn_blocking(f).await.map_err(|e| Error::Kadmin(e.to_string()))
 }
 
-pub fn secret(kp: &KerberosPrincipal, keytab: Vec<u8>, fingerprint: &str, krb5_conf: &str) -> Secret {
+pub fn secret(kp: &KerberosPrincipal, files: BTreeMap<String, Vec<u8>>, fingerprint: &str) -> Secret {
     Secret {
         metadata: ObjectMeta {
             name: Some(kp.secret_name()),
@@ -371,10 +484,7 @@ pub fn secret(kp: &KerberosPrincipal, keytab: Vec<u8>, fingerprint: &str, krb5_c
             ..Default::default()
         },
         type_: Some("Opaque".into()),
-        data: Some(BTreeMap::from([
-            (kp.keytab_key(), ByteString(keytab)),
-            (KRB5_CONF_KEY.to_string(), ByteString(krb5_conf.as_bytes().to_vec())),
-        ])),
+        data: Some(files.into_iter().map(|(k, v)| (k, ByteString(v))).collect()),
         ..Default::default()
     }
 }
@@ -397,8 +507,9 @@ async fn set_status(client: &Client, kp: &KerberosPrincipal, status: KerberosPri
     Ok(())
 }
 
-async fn apply(kp: Arc<KerberosPrincipal>, client: &Client) -> Result<Action, Error> {
-    match sync(&kp, client).await {
+async fn apply(kp: Arc<KerberosPrincipal>, ctx: &Context) -> Result<Action, Error> {
+    let client = &ctx.client;
+    match sync(&kp, ctx).await {
         // What is wrong with the object (or its realm) goes in its status.
         Err(e) if e.reason().is_some() => {
             let reason = e.reason().unwrap_or_default();
@@ -411,24 +522,38 @@ async fn apply(kp: Arc<KerberosPrincipal>, client: &Client) -> Result<Action, Er
                 ..Default::default()
             };
             set_status(client, &kp, status).await?;
-            Ok(Action::requeue(Duration::from_secs(if reason == "RealmNotReady" { 10 } else { 60 })))
+            let wait = match reason {
+                "RealmNotReady" => 10,
+                "StatefulSetNotFound" => 30,
+                _ => 60,
+            };
+            Ok(Action::requeue(Duration::from_secs(wait)))
         }
         r => r,
     }
 }
 
-async fn sync(kp: &KerberosPrincipal, client: &Client) -> Result<Action, Error> {
+async fn sync(kp: &KerberosPrincipal, ctx: &Context) -> Result<Action, Error> {
+    let client = &ctx.client;
     let (realm, admin) = admin_for(client, kp, true).await?;
     let krb5_conf = realm::config_files(&realm).remove(KRB5_CONF_KEY).unwrap_or_default();
-    let ps = principals(&kp.spec.principals, &admin.realm)?;
+    let ns = kp.namespace().unwrap_or_else(|| "default".into());
+    let sts = match &kp.spec.host_principals {
+        Some(hp) => {
+            Some(Api::<StatefulSet>::namespaced(client.clone(), &ns).get_opt(&hp.stateful_set).await?.ok_or_else(
+                || Error::StatefulSetNotFound(format!("StatefulSet {ns}/{} does not exist", hp.stateful_set)),
+            )?)
+        }
+        None => None,
+    };
+    let wanted = wanted(kp, sts.as_ref(), &ctx.cluster_domain, &admin.realm)?;
+    let ps: Vec<Principal> = wanted.iter().map(|w| w.principal.clone()).collect();
     let keys = {
         let (admin, ps, owner) = (admin.clone(), ps.clone(), kp.owner());
         blocking(move || admin.ensure(&ps, &owner)).await??
     };
-    let kt = keytab(&keys);
     let fp = fingerprint(&keys);
 
-    let ns = kp.namespace().unwrap_or_else(|| "default".into());
     let secrets: Api<Secret> = Api::namespaced(client.clone(), &ns);
     let name = kp.secret_name();
     let current = secrets.get_opt(&name).await?;
@@ -440,36 +565,64 @@ async fn sync(kp: &KerberosPrincipal, client: &Client) -> Result<Action, Error> 
             })
     });
     if !unchanged {
-        let s = secret(kp, kt.to_bytes(), &fp, &krb5_conf);
+        let s = secret(kp, secret_files(&wanted, &keys, &kp.keytab_key(), &krb5_conf), &fp);
         secrets.patch(&name, &PatchParams::apply(MANAGER).force(), &Patch::Apply(&s)).await?;
-        info!("Wrote the keytab of {} to Secret {}/{}", kp.name_any(), ns, name);
+        info!("Wrote the keytab of {} ({} principals) to Secret {}/{}", kp.name_any(), keys.len(), ns, name);
     }
 
-    let verified = {
-        let (admin, ps) = (admin.clone(), ps.clone());
-        blocking(move || admin.verify(&ps, &kt)).await?
-    };
-    let cond = match &verified {
-        Ok(()) => condition(true, "KeytabVerified", "every principal got a ticket with its keytab key"),
-        Err(e) => condition(false, "KeytabRejected", e),
-    };
-    if let Err(e) = &verified {
-        warn!("{}: {}", kp.name_any(), e);
+    // Principals it no longer wants (a scale-down, a spec change) go, now
+    // that the Secret no longer holds them.
+    let gone = unwanted(kp, &wanted);
+    if !gone.is_empty() && kp.spec.deletion_policy == DeletionPolicy::Delete {
+        let (admin, owner) = (admin.clone(), kp.owner());
+        if let Err(e) = blocking(move || admin.delete(&gone, &owner)).await? {
+            warn!("{}: deleting principals it no longer wants: {e}", kp.name_any());
+        }
     }
+
+    // A ticket with each key: when the keys changed or it was not Ready
+    // (the keys cannot change otherwise), not every resync.
+    let was_ready = kp.status.as_ref().is_some_and(|s| {
+        s.observed_generation == kp.metadata.generation
+            && s.conditions.iter().any(|c| c.type_ == "Ready" && c.status == "True")
+    });
+    let cond = if unchanged && was_ready {
+        kp.status.as_ref().and_then(|s| s.conditions.iter().find(|c| c.type_ == "Ready").cloned())
+    } else {
+        None
+    };
+    let cond = match cond {
+        Some(c) => c,
+        None => {
+            let (admin, ps, kt) = (admin.clone(), ps.clone(), keytab(&keys));
+            match blocking(move || admin.verify(&ps, &kt)).await? {
+                Ok(()) => condition(true, "KeytabVerified", "every principal got a ticket with its keytab key"),
+                Err(e) => {
+                    warn!("{}: {}", kp.name_any(), e);
+                    condition(false, "KeytabRejected", &e)
+                }
+            }
+        }
+    };
+    let ready = cond.status == "True";
     let status = KerberosPrincipalStatus {
         secret_name: Some(name),
-        principals: keys
+        principals: wanted
             .iter()
-            .map(|(p, ks)| PrincipalStatus {
+            .zip(&keys)
+            .map(|(w, (p, ks))| PrincipalStatus {
                 name: format!("{}@{}", p.name(), p.realm),
                 kvno: ks.iter().map(|(v, _)| *v).max().unwrap_or(0),
+                pod: w.pod.clone(),
             })
             .collect(),
         conditions: vec![cond],
         observed_generation: kp.metadata.generation,
     };
-    set_status(client, kp, status).await?;
-    Ok(Action::requeue(if verified.is_ok() { Duration::from_secs(300) } else { Duration::from_secs(30) }))
+    if kp.status.as_ref() != Some(&status) {
+        set_status(client, kp, status).await?;
+    }
+    Ok(Action::requeue(if ready { Duration::from_secs(300) } else { Duration::from_secs(30) }))
 }
 
 async fn cleanup(kp: Arc<KerberosPrincipal>, client: &Client) -> Result<Action, Error> {
@@ -490,8 +643,14 @@ async fn cleanup(kp: Arc<KerberosPrincipal>, client: &Client) -> Result<Action, 
         }
         Err(e) => return Err(e),
     };
-    // Names that are not valid (or reserved) were never created.
-    let Ok(ps) = principals(&kp.spec.principals, &admin.realm) else { return Ok(Action::await_change()) };
+    // What it has (its status: host principals too) and what it names;
+    // names that are not valid (or reserved) were never created.
+    let mut ps = unwanted(&kp, &[]);
+    for p in principals(&kp.spec.principals, &admin.realm).unwrap_or_default() {
+        if !ps.contains(&p) {
+            ps.push(p);
+        }
+    }
     let owner = kp.owner();
     blocking(move || admin.delete(&ps, &owner)).await??;
     Ok(Action::await_change())
@@ -500,11 +659,10 @@ async fn cleanup(kp: Arc<KerberosPrincipal>, client: &Client) -> Result<Action, 
 pub async fn reconcile(kp: Arc<KerberosPrincipal>, ctx: Arc<Context>) -> Result<Action, Error> {
     let ns = kp.namespace().unwrap_or_else(|| "default".into());
     let api: Api<KerberosPrincipal> = Api::namespaced(ctx.client.clone(), &ns);
-    let client = ctx.client.clone();
-    finalizer(&api, FINALIZER, kp, |event| async move {
+    finalizer(&api, FINALIZER, kp, |event| async {
         match event {
-            Event::Apply(kp) => apply(kp, &client).await,
-            Event::Cleanup(kp) => cleanup(kp, &client).await,
+            Event::Apply(kp) => apply(kp, &ctx).await,
+            Event::Cleanup(kp) => cleanup(kp, &ctx.client).await,
         }
     })
     .await
@@ -668,18 +826,146 @@ mod tests {
         );
         kp.metadata.namespace = Some("hdfs".into());
         kp.metadata.uid = Some("u-2".into());
-        let s = secret(&kp, vec![5, 2], "ab", "[libdefaults]\n");
+        let files = |key: &str| BTreeMap::from([(key.to_string(), vec![5, 2])]);
+        let s = secret(&kp, files("krb5.keytab"), "ab");
         assert_eq!(s.metadata.annotations.as_ref().unwrap()[KEYS_SHA256], "ab");
-        assert_eq!(s.data.as_ref().unwrap()[KRB5_CONF_KEY].0, b"[libdefaults]\n");
         assert_eq!(s.metadata.name.as_deref(), Some("pillar-nn"));
         assert_eq!(s.metadata.owner_references.unwrap()[0].uid, "u-2");
         assert_eq!(s.data.unwrap()["krb5.keytab"].0, vec![5, 2]);
         kp.spec.secret_name = Some("nn-keytab".into());
         kp.spec.keytab_key = Some("nn.keytab".into());
-        let s = secret(&kp, vec![], "ab", "");
+        assert_eq!(kp.keytab_key(), "nn.keytab");
+        let s = secret(&kp, files("nn.keytab"), "ab");
         assert_eq!(s.metadata.name.as_deref(), Some("nn-keytab"));
         assert!(s.data.unwrap().contains_key("nn.keytab"));
         assert_eq!(kp.spec.deletion_policy, DeletionPolicy::Delete);
+    }
+
+    fn sts(name: &str, service: Option<&str>, replicas: Option<i32>) -> StatefulSet {
+        let mut s = StatefulSet::default();
+        s.metadata.name = Some(name.into());
+        s.spec = Some(k8s_openapi::api::apps::v1::StatefulSetSpec {
+            service_name: service.map(Into::into),
+            replicas,
+            ..Default::default()
+        });
+        s
+    }
+
+    fn with_hosts(principals: &[&str], sts: &str, services: &[&str]) -> KerberosPrincipal {
+        let mut kp = KerberosPrincipal::new(
+            "dn",
+            KerberosPrincipalSpec {
+                realm_ref: "corp".into(),
+                principals: principals.iter().map(|p| p.to_string()).collect(),
+                host_principals: Some(HostPrincipals {
+                    stateful_set: sts.into(),
+                    services: services.iter().map(|s| s.to_string()).collect(),
+                }),
+                ..Default::default()
+            },
+        );
+        kp.metadata.namespace = Some("hdfs".into());
+        kp
+    }
+
+    fn names(w: &[Wanted]) -> Vec<(String, Option<String>)> {
+        w.iter().map(|w| (w.principal.name(), w.pod.clone())).collect()
+    }
+
+    #[test]
+    fn host_principals_name_each_pod_of_the_stateful_set() {
+        let kp = with_hosts(&["hdfs"], "pillar-dn", &["dn", "HTTP"]);
+        let set = sts("pillar-dn", Some("pillar-dn"), Some(2));
+        let w = wanted(&kp, Some(&set), "cluster.local", "CORP.TEST").unwrap();
+        let pod = |i: u8| Some(format!("pillar-dn-{i}"));
+        assert_eq!(
+            names(&w),
+            vec![
+                ("hdfs".into(), None),
+                ("dn/pillar-dn-0.pillar-dn.hdfs.svc.cluster.local".into(), pod(0)),
+                ("HTTP/pillar-dn-0.pillar-dn.hdfs.svc.cluster.local".into(), pod(0)),
+                ("dn/pillar-dn-1.pillar-dn.hdfs.svc.cluster.local".into(), pod(1)),
+                ("HTTP/pillar-dn-1.pillar-dn.hdfs.svc.cluster.local".into(), pod(1)),
+            ]
+        );
+        assert!(w.iter().all(|w| w.principal.realm == "CORP.TEST"));
+        // The cluster domain, and the default of one replica.
+        let w = wanted(&kp, Some(&sts("pillar-dn", Some("dns"), None)), "k8s.example", "CORP.TEST").unwrap();
+        assert_eq!(w[1].principal.name(), "dn/pillar-dn-0.dns.hdfs.svc.k8s.example");
+        assert_eq!(w.len(), 3);
+        // Scaled to zero: only the plain ones; with none at all, nothing
+        // (not an error: the StatefulSet may scale up).
+        let zero = sts("pillar-dn", Some("pillar-dn"), Some(0));
+        assert_eq!(wanted(&kp, Some(&zero), "cluster.local", "CORP.TEST").unwrap().len(), 1);
+        let only_hosts = with_hosts(&[], "pillar-dn", &["dn"]);
+        assert!(wanted(&only_hosts, Some(&zero), "cluster.local", "CORP.TEST").unwrap().is_empty());
+        // A name in both lists once.
+        let both = with_hosts(&["dn/pillar-dn-0.pillar-dn.hdfs.svc.cluster.local"], "pillar-dn", &["dn"]);
+        assert_eq!(wanted(&both, Some(&set), "cluster.local", "CORP.TEST").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn host_principals_need_a_service_name_and_plain_services() {
+        let kp = with_hosts(&[], "pillar-dn", &["dn"]);
+        let r = wanted(&kp, Some(&sts("pillar-dn", None, Some(1))), "cluster.local", "CORP.TEST");
+        assert!(matches!(r, Err(Error::Invalid(m)) if m.contains("serviceName")));
+        let set = sts("pillar-dn", Some("pillar-dn"), Some(1));
+        for bad in [&["dn/x"][..], &["dn@X"], &[""], &[], &["krbtgt"], &["kadmin"]] {
+            let kp = with_hosts(&[], "pillar-dn", bad);
+            assert!(matches!(wanted(&kp, Some(&set), "cluster.local", "CORP.TEST"), Err(Error::Invalid(_))), "{bad:?}");
+        }
+        // Without host principals, some principal is required.
+        let mut none = with_hosts(&[], "x", &["dn"]);
+        none.spec.host_principals = None;
+        assert!(matches!(wanted(&none, None, "cluster.local", "CORP.TEST"), Err(Error::Invalid(_))));
+    }
+
+    #[test]
+    fn each_pod_gets_its_own_keytab_and_all_keys_are_in_one() {
+        let k = |b: u8| krb5::Key::new(18, vec![b; 32]).unwrap();
+        let kp = with_hosts(&["hdfs"], "dn", &["dn", "HTTP"]);
+        let w = wanted(&kp, Some(&sts("dn", Some("dn"), Some(2))), "cluster.local", "CORP.TEST").unwrap();
+        let keys: Vec<PrincipalKeys> =
+            w.iter().enumerate().map(|(i, w)| (w.principal.clone(), vec![(1, k(i as u8))])).collect();
+        let files = secret_files(&w, &keys, "krb5.keytab", "conf");
+        assert_eq!(files.keys().collect::<Vec<_>>(), vec!["dn-0.keytab", "dn-1.keytab", "krb5.conf", "krb5.keytab"]);
+        assert_eq!(files["krb5.conf"], b"conf");
+        let has = |file: &str, b: u8| files[file].windows(32).any(|w| w == [b; 32]);
+        // Keys 0..5: hdfs, dn-0's dn and HTTP, dn-1's dn and HTTP.
+        assert!((0..5).all(|b| has("krb5.keytab", b)), "every key in krb5.keytab");
+        assert!(has("dn-0.keytab", 1) && has("dn-0.keytab", 2));
+        assert!(has("dn-1.keytab", 3) && has("dn-1.keytab", 4));
+        for (file, others) in [("dn-0.keytab", [0, 3, 4]), ("dn-1.keytab", [0, 1, 2])] {
+            assert!(others.iter().all(|b| !has(file, *b)), "{file} holds only its pod's keys");
+        }
+        assert_eq!(files["dn-1.keytab"].len(), keytab(&keys[3..5]).to_bytes().len());
+        assert_eq!(files["dn-1.keytab"][..2], [5, 2]);
+    }
+
+    #[test]
+    fn principals_no_longer_wanted_are_the_ones_to_delete() {
+        let mut kp = with_hosts(&[], "dn", &["dn"]);
+        let set = |n| sts("dn", Some("dn"), Some(n));
+        let three = wanted(&kp, Some(&set(3)), "cluster.local", "CORP.TEST").unwrap();
+        kp.status = Some(KerberosPrincipalStatus {
+            principals: three
+                .iter()
+                .map(|w| PrincipalStatus {
+                    name: format!("{}@{}", w.principal.name(), w.principal.realm),
+                    kvno: 1,
+                    pod: w.pod.clone(),
+                })
+                .collect(),
+            ..Default::default()
+        });
+        assert!(unwanted(&kp, &three).is_empty());
+        let one = wanted(&kp, Some(&set(1)), "cluster.local", "CORP.TEST").unwrap();
+        let gone: Vec<String> = unwanted(&kp, &one).iter().map(|p| p.name()).collect();
+        assert_eq!(gone, vec!["dn/dn-1.dn.hdfs.svc.cluster.local", "dn/dn-2.dn.hdfs.svc.cluster.local"]);
+        assert!(unwanted(&kp, &one).iter().all(|p| p.realm == "CORP.TEST"));
+        // Cleanup: everything it has.
+        assert_eq!(unwanted(&kp, &[]).len(), 3);
     }
 
     /// The test KDC from `scripts/test-kdc.sh`, if its env is set.

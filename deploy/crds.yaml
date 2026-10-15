@@ -198,11 +198,32 @@ spec:
                 - Delete
                 - Retain
                 type: string
+              hostPrincipals:
+                description: |-
+                  Host principals for every pod of a StatefulSet, following its
+                  replicas.
+                nullable: true
+                properties:
+                  services:
+                    description: Service names (`dn`, `HTTP`).
+                    items:
+                      type: string
+                    type: array
+                  statefulSet:
+                    description: |-
+                      The StatefulSet (this object's namespace); its `serviceName` gives
+                      the pods their DNS names.
+                    type: string
+                required:
+                - services
+                - statefulSet
+                type: object
               keytabKey:
                 description: The key in that Secret (default `krb5.keytab`).
                 nullable: true
                 type: string
               principals:
+                default: []
                 description: |-
                   Principal names (`nn/host.example.com`): the realm is appended, or,
                   if given (`...@REALM`), must be the realm's.
@@ -223,7 +244,6 @@ spec:
                 nullable: true
                 type: string
             required:
-            - principals
             - realmRef
             type: object
           status:
@@ -267,6 +287,10 @@ spec:
                       minimum: 0.0
                       type: integer
                     name:
+                      type: string
+                    pod:
+                      description: The pod a host principal is for.
+                      nullable: true
                       type: string
                   required:
                   - kvno

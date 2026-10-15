@@ -13,8 +13,9 @@ use futures::StreamExt;
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::{ConfigMap, Secret, Service};
 use kube::runtime::controller::Controller;
+use kube::runtime::reflector::ObjectRef;
 use kube::runtime::watcher;
-use kube::{Api, Client, CustomResourceExt};
+use kube::{Api, Client, CustomResourceExt, ResourceExt};
 use tracing::{info, warn};
 
 use crd::{KerberosPrincipal, KerberosRealm};
@@ -60,9 +61,27 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     let principals: Api<KerberosPrincipal> = Api::all(client.clone());
-    let pctx = Arc::new(principal::Context { client: client.clone() });
-    let principal_controller = Controller::new(principals, watcher::Config::default())
+    let pctx = Arc::new(principal::Context {
+        client: client.clone(),
+        cluster_domain: std::env::var("CLUSTER_DOMAIN").unwrap_or_else(|_| "cluster.local".into()),
+    });
+    let controller = Controller::new(principals, watcher::Config::default());
+    // A StatefulSet's scaling reaches the KerberosPrincipals with host
+    // principals for its pods.
+    let store = controller.store();
+    let principal_controller = controller
         .owns(Api::<Secret>::all(client.clone()), watcher::Config::default())
+        .watches(Api::<StatefulSet>::all(client.clone()), watcher::Config::default(), move |sts| {
+            let (ns, name) = (sts.namespace(), sts.name_any());
+            store
+                .state()
+                .into_iter()
+                .filter(|kp| {
+                    kp.namespace() == ns && kp.spec.host_principals.as_ref().is_some_and(|h| h.stateful_set == name)
+                })
+                .map(|kp| ObjectRef::from_obj(&*kp))
+                .collect::<Vec<_>>()
+        })
         .shutdown_on_signal()
         .run(principal::reconcile, principal::error_policy, pctx)
         .for_each(|r| async move {

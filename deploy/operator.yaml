@@ -107,6 +107,8 @@ spec:
           env:
             - name: RUST_LOG
               value: "info,krb5=warn"
+            - name: CLUSTER_DOMAIN
+              value: "cluster.local"
             - name: KRB5_KDC_IMAGE
               value: "ghcr.io/ddalton/krb5-kdc:0.1.2"
           resources:
