@@ -1,6 +1,6 @@
 [package]
 name = "krb5-operator"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Kubernetes operator for MIT Kerberos realms and principals"

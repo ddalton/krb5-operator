@@ -1,12 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 — 2026-10-15
 
 - `KerberosNodeKeytab` (cluster-scoped): `host/` and `nfs/` principals for
   the nodes it selects. A DaemonSet (`krb5-operator node-agent`) merges
   their keys into each node's `/etc/krb5.keytab`, keeping other realms'
   entries, and optionally writes a `krb5.conf` that names the KDC by
-  cluster IP. This is what `rpc.gssd` needs for `sec=krb5*` NFS mounts.
+  cluster IP and maps the cluster's Services (`.svc.<clusterDomain>`) to
+  the realm. This is what `rpc.gssd` needs for `sec=krb5*` NFS mounts.
   Nodes that go, or are no longer selected, have their principals deleted.
 - RBAC: nodes (read) and DaemonSets. The operator's namespace is labelled
   for privileged pods in `deploy/operator.yaml`.
