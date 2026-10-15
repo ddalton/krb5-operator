@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.1.2 — 2026-10-15
+
+- Security: a `KerberosPrincipal` could get the keys of any principal
+  that already existed in the KDC, `krbtgt/REALM` (which forges any
+  ticket) and `kadmin/admin` included. Now principals the operator creates
+  are marked with their owner (`<namespace>/<name>`), only the owner gets
+  their keys or deletes them, others get `Conflict`, and the KDC's,
+  kadmind's and the operator's own principals are refused (`Invalid`).
+  Upgrade from 0.1.0 and 0.1.1. Principals those versions created have no
+  owner mark, so they report `Conflict`. To have the operator manage one
+  again, mark it with
+  `kadmin.local setstr <principal> krb5-operator/owner <namespace>/<name>`,
+  or delete it so it is recreated with new keys.
+- Cross-namespace realms: `KerberosPrincipal.spec.realmNamespace`, and
+  `KerberosRealm.spec.allowedNamespaces` (`Same`, the default, `All`, or
+  `Selector`); other namespaces get `NotAllowed`.
+- The keytab Secret also holds the realm's `krb5.conf`.
+- Problems with a `KerberosPrincipal` are its `Ready` condition's reason
+  (`Invalid`, `Conflict`, `NotAllowed`, `RealmNotReady`).
+
 ## 0.1.1 — 2026-10-15
 
 - Fix: a keytab Secret was rewritten on nearly every reconcile, because

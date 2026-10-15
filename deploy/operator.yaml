@@ -14,9 +14,9 @@ metadata:
   labels:
     app.kubernetes.io/name: krb5-operator
     app.kubernetes.io/instance: krb5-operator
-    app.kubernetes.io/version: "0.1.1"
+    app.kubernetes.io/version: "0.1.2"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: krb5-operator-0.1.1
+    helm.sh/chart: krb5-operator-0.1.2
 ---
 # Source: krb5-operator/templates/rbac.yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -26,9 +26,9 @@ metadata:
   labels:
     app.kubernetes.io/name: krb5-operator
     app.kubernetes.io/instance: krb5-operator
-    app.kubernetes.io/version: "0.1.1"
+    app.kubernetes.io/version: "0.1.2"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: krb5-operator-0.1.1
+    helm.sh/chart: krb5-operator-0.1.2
 rules:
   - apiGroups: [krb5.ddalton.dev]
     resources: [kerberosrealms, kerberosprincipals]
@@ -56,9 +56,9 @@ metadata:
   labels:
     app.kubernetes.io/name: krb5-operator
     app.kubernetes.io/instance: krb5-operator
-    app.kubernetes.io/version: "0.1.1"
+    app.kubernetes.io/version: "0.1.2"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: krb5-operator-0.1.1
+    helm.sh/chart: krb5-operator-0.1.2
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
@@ -77,9 +77,9 @@ metadata:
   labels:
     app.kubernetes.io/name: krb5-operator
     app.kubernetes.io/instance: krb5-operator
-    app.kubernetes.io/version: "0.1.1"
+    app.kubernetes.io/version: "0.1.2"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: krb5-operator-0.1.1
+    helm.sh/chart: krb5-operator-0.1.2
 spec:
   # One: the controllers are not leader-elected.
   replicas: 1
@@ -102,13 +102,13 @@ spec:
           type: RuntimeDefault
       containers:
         - name: operator
-          image: "ghcr.io/ddalton/krb5-operator:0.1.1"
+          image: "ghcr.io/ddalton/krb5-operator:0.1.2"
           imagePullPolicy: IfNotPresent
           env:
             - name: RUST_LOG
               value: "info,krb5=warn"
             - name: KRB5_KDC_IMAGE
-              value: "ghcr.io/ddalton/krb5-kdc:0.1.1"
+              value: "ghcr.io/ddalton/krb5-kdc:0.1.2"
           resources:
             limits:
               memory: 128Mi
