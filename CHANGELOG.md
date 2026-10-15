@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- krb5 0.12. Keytab logins (verifying a keytab) use SPAKE when the KDC
+- krb5 0.12.1 (its AP-REQ parsing panic fix). Keytab logins (verifying a keytab) use SPAKE when the KDC
   offers it.
 
 ## 0.3.0 — 2026-10-15
