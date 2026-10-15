@@ -140,7 +140,9 @@ spec:
   other realms stay, and this realm's are replaced. Files are written
   atomically, only when they change. With `krb5ConfPath` it also writes
   the realm's `krb5.conf` there, naming the KDC by its Service's cluster
-  IP, since nodes do not resolve cluster DNS.
+  IP, since nodes do not resolve cluster DNS, and maps the cluster's
+  Services (`.svc.<clusterDomain>`) to the realm, which `rpc.gssd` needs
+  to find the realm of an NFS server named after a Service.
 - A node that goes away or stops being selected has its principals deleted
   from the KDC, and so does deleting the object (unless
   `deletionPolicy: Retain`). Keys already on the node stay in its keytab,

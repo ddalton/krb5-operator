@@ -73,6 +73,8 @@ pub struct Context {
     pub namespace: String,
     /// The operator's image, which the DaemonSet runs (`node-agent`).
     pub agent_image: String,
+    /// The cluster's DNS domain (`CLUSTER_DOMAIN`).
+    pub cluster_domain: String,
 }
 
 /// The name a node calls itself: its `Hostname` address (else its name),
@@ -175,8 +177,11 @@ pub fn wanted(nk: &KerberosNodeKeytab, nodes: &[Node], realm: &str) -> Result<Ve
 }
 
 /// `krb5.conf` for nodes: the KDC and kadmind by the realm Service's
-/// cluster IP, and `domain` mapped to the realm.
-pub fn host_krb5_conf(realm: &str, cluster_ip: &str, domain: Option<&str>) -> String {
+/// cluster IP; the cluster's Services (`svc.<cluster_domain>`) and `domain`
+/// mapped to the realm. rpc.gssd picks the realm of an NFS server from its
+/// name's domain: without the mapping it would look for `SVC.CLUSTER.LOCAL`
+/// keys.
+pub fn host_krb5_conf(realm: &str, cluster_ip: &str, cluster_domain: &str, domain: Option<&str>) -> String {
     let ip = if cluster_ip.contains(':') { format!("[{cluster_ip}]") } else { cluster_ip.to_string() };
     let mut s = format!(
         "# Written by krb5-operator for realm {realm}.\n\
@@ -185,8 +190,10 @@ pub fn host_krb5_conf(realm: &str, cluster_ip: &str, domain: Option<&str>) -> St
         realm::KDC_PORT,
         realm::KADMIN_PORT
     );
+    let svc = format!("svc.{}", cluster_domain.trim_matches('.').to_lowercase());
+    s.push_str(&format!("\n[domain_realm]\n    .{svc} = {realm}\n"));
     if let Some(d) = domain.map(|d| d.trim_matches('.').to_lowercase()).filter(|d| !d.is_empty()) {
-        s.push_str(&format!("\n[domain_realm]\n    .{d} = {realm}\n    {d} = {realm}\n"));
+        s.push_str(&format!("    .{d} = {realm}\n    {d} = {realm}\n"));
     }
     s
 }
@@ -411,7 +418,7 @@ async fn sync(nk: &KerberosNodeKeytab, ctx: &Context) -> Result<Action, Error> {
         .and_then(|s| s.spec?.cluster_ip)
         .filter(|ip| !ip.is_empty() && ip != "None")
         .ok_or_else(|| Error::RealmNotReady(realm.name_any(), "its Service has no cluster IP".into()))?;
-    let conf = host_krb5_conf(&admin.realm, &svc, nk.spec.domain.as_deref());
+    let conf = host_krb5_conf(&admin.realm, &svc, &ctx.cluster_domain, nk.spec.domain.as_deref());
 
     let ns = &ctx.namespace;
     let name = nk.object_name();
@@ -706,14 +713,16 @@ mod tests {
 
     #[test]
     fn hosts_reach_the_kdc_by_cluster_ip() {
-        let c = host_krb5_conf("CORP.TEST", "10.96.0.12", Some("Corp.Example"));
+        let c = host_krb5_conf("CORP.TEST", "10.96.0.12", "cluster.local", Some("Corp.Example"));
         assert!(c.contains("default_realm = CORP.TEST"));
         assert!(c.contains("kdc = 10.96.0.12:88"));
         assert!(c.contains("admin_server = 10.96.0.12:749"));
         assert!(c.contains(".corp.example = CORP.TEST"));
-        let v6 = host_krb5_conf("CORP.TEST", "fd00::12", None);
+        assert!(c.contains(".svc.cluster.local = CORP.TEST"), "NFS servers by their Service names");
+        let v6 = host_krb5_conf("CORP.TEST", "fd00::12", "k8s.example", None);
         assert!(v6.contains("kdc = [fd00::12]:88"));
-        assert!(!v6.contains("domain_realm"));
+        assert!(v6.contains(".svc.k8s.example = CORP.TEST"));
+        assert_eq!(v6.matches(" = CORP.TEST").count(), 2, "default_realm and the Services");
     }
 
     #[test]

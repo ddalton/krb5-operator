@@ -123,6 +123,7 @@ async fn main() -> anyhow::Result<()> {
         namespace: namespace.clone(),
         agent_image: std::env::var("KRB5_OPERATOR_IMAGE")
             .unwrap_or_else(|_| format!("ghcr.io/ddalton/krb5-operator:{}", env!("CARGO_PKG_VERSION"))),
+        cluster_domain: std::env::var("CLUSTER_DOMAIN").unwrap_or_else(|_| "cluster.local".into()),
     });
     let node_keytabs = Controller::new(Api::<KerberosNodeKeytab>::all(client.clone()), watcher::Config::default());
     let store = node_keytabs.store();
