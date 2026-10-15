@@ -1,0 +1,6 @@
+apiVersion: krb5.ddalton.dev/v1alpha1
+kind: KerberosRealm
+metadata:
+  name: nodes
+spec:
+  realm: NODES.TEST

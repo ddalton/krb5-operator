@@ -7,18 +7,28 @@ metadata:
     {{- include "krb5-operator.labels" . | nindent 4 }}
 rules:
   - apiGroups: [krb5.ddalton.dev]
-    resources: [kerberosrealms, kerberosprincipals]
+    resources: [kerberosrealms, kerberosprincipals, kerberosnodekeytabs]
     verbs: [get, list, watch, patch, update]
   - apiGroups: [krb5.ddalton.dev]
-    resources: [kerberosrealms/status, kerberosprincipals/status, kerberosprincipals/finalizers]
+    resources:
+      - kerberosrealms/status
+      - kerberosprincipals/status
+      - kerberosprincipals/finalizers
+      - kerberosnodekeytabs/status
+      - kerberosnodekeytabs/finalizers
     verbs: [get, patch, update]
   # Realms: the master key and admin password; principals: keytabs.
   - apiGroups: [""]
     resources: [secrets, configmaps, services]
     verbs: [get, list, watch, create, patch, update]
+  # Realms' KDCs; KerberosNodeKeytabs' agents (in the operator's namespace).
   - apiGroups: [apps]
-    resources: [statefulsets]
+    resources: [statefulsets, daemonsets]
     verbs: [get, list, watch, create, patch, update]
+  # KerberosNodeKeytabs name nodes' principals after their hostnames.
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch]
   # A realm's allowedNamespaces selector matches namespace labels.
   - apiGroups: [""]
     resources: [namespaces]

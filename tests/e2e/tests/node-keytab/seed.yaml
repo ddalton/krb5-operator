@@ -1,0 +1,26 @@
+# The node's keytab before the operator: a key of another realm (as a
+# node joined to some other KDC has), which must survive the merge.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: seed
+spec:
+  restartPolicy: Never
+  containers:
+  - name: seed
+    image: krb5-kdc:e2e
+    imagePullPolicy: Never
+    command: [sh, -euc]
+    args:
+    - |
+      rm -f /host/krb5.keytab /host/krb5.conf
+      printf 'addent -password -p someone@OTHER.TEST -k 1 -e aes256-cts-hmac-sha1-96\nsecret\nwkt /host/krb5.keytab\nq\n' | ktutil
+      klist -k /host/krb5.keytab
+    volumeMounts:
+    - name: host
+      mountPath: /host
+  volumes:
+  - name: host
+    hostPath:
+      path: /var/lib/krb5-e2e
+      type: DirectoryOrCreate

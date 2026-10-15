@@ -288,6 +288,10 @@ spec:
                       type: integer
                     name:
                       type: string
+                    node:
+                      description: The node a node principal is for.
+                      nullable: true
+                      type: string
                     pod:
                       description: The pod a host principal is for.
                       nullable: true
@@ -305,6 +309,191 @@ spec:
         required:
         - spec
         title: KerberosPrincipal
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: kerberosnodekeytabs.krb5.ddalton.dev
+spec:
+  group: krb5.ddalton.dev
+  names:
+    kind: KerberosNodeKeytab
+    plural: kerberosnodekeytabs
+    shortNames:
+    - knk
+    singular: kerberosnodekeytab
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.realmRef
+      name: Realm
+      type: string
+    - jsonPath: .status.nodes
+      name: Nodes
+      type: integer
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for KerberosNodeKeytabSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              Host keytabs for nodes: `<service>/<node hostname>` for each selected
+              node, installed into the node's keytab (`/etc/krb5.keytab`) by a
+              DaemonSet in the operator's namespace. What the kernel's NFS client
+              (rpc.gssd) needs for `sec=krb5*` mounts.
+
+              Cluster-scoped: it has the operator write files on nodes, which is for
+              cluster administrators to ask for.
+            properties:
+              deletionPolicy:
+                default: Delete
+                description: '`Delete` (default) or `Retain` the principals when this is deleted.'
+                enum:
+                - Delete
+                - Retain
+                type: string
+              domain:
+                description: |-
+                  Appended to a node hostname without a dot (`worker1` →
+                  `worker1.example.com`); the name must be what the node calls itself.
+                nullable: true
+                type: string
+              keytabPath:
+                description: |-
+                  The keytab on the node (default `/etc/krb5.keytab`). Entries of
+                  other realms in it are kept.
+                nullable: true
+                type: string
+              krb5ConfPath:
+                description: |-
+                  Also write a `krb5.conf` for the realm there (the KDC by its
+                  Service's cluster IP: nodes do not resolve cluster DNS), e.g.
+                  `/etc/krb5.conf.d/krb5-operator.conf`. Default: none.
+                nullable: true
+                type: string
+              nodeSelector:
+                additionalProperties:
+                  type: string
+                description: |-
+                  The nodes (labels they must have; default: every node whose taints
+                  `tolerations` tolerate).
+                nullable: true
+                type: object
+              realmNamespace:
+                description: Its namespace.
+                type: string
+              realmRef:
+                description: The `KerberosRealm` the principals belong to.
+                type: string
+              services:
+                default:
+                - host
+                - nfs
+                description: 'Service names (default `host`, `nfs`): `<service>/<node hostname>`.'
+                items:
+                  type: string
+                type: array
+              tolerations:
+                description: Tolerations for the DaemonSet, and so for which nodes get keys.
+                items:
+                  description: The pod this Toleration is attached to tolerates any taint that matches the triple <key,value,effect> using the matching operator <operator>.
+                  properties:
+                    effect:
+                      description: Effect indicates the taint effect to match. Empty means match all taint effects. When specified, allowed values are NoSchedule, PreferNoSchedule and NoExecute.
+                      type: string
+                    key:
+                      description: Key is the taint key that the toleration applies to. Empty means match all taint keys. If the key is empty, operator must be Exists; this combination means to match all values and all keys.
+                      type: string
+                    operator:
+                      description: Operator represents a key's relationship to the value. Valid operators are Exists and Equal. Defaults to Equal. Exists is equivalent to wildcard for value, so that a pod can tolerate all taints of a particular category.
+                      type: string
+                    tolerationSeconds:
+                      description: TolerationSeconds represents the period of time the toleration (which must be of effect NoExecute, otherwise this field is ignored) tolerates the taint. By default, it is not set, which means tolerate the taint forever (do not evict). Zero and negative values will be treated as 0 (evict immediately) by the system.
+                      format: int64
+                      type: integer
+                    value:
+                      description: Value is the taint value the toleration matches to. If the operator is Exists, the value should be empty, otherwise just a regular string.
+                      type: string
+                  type: object
+                nullable: true
+                type: array
+            required:
+            - realmNamespace
+            - realmRef
+            type: object
+          status:
+            nullable: true
+            properties:
+              conditions:
+                default: []
+                items:
+                  description: A status condition (the Kubernetes convention).
+                  properties:
+                    lastTransitionTime:
+                      type: string
+                    message:
+                      type: string
+                    reason:
+                      type: string
+                    status:
+                      description: '`True`, `False` or `Unknown`.'
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              nodes:
+                default: 0
+                description: How many nodes have keys.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              observedGeneration:
+                format: int64
+                nullable: true
+                type: integer
+              principals:
+                default: []
+                items:
+                  properties:
+                    kvno:
+                      format: uint32
+                      minimum: 0.0
+                      type: integer
+                    name:
+                      type: string
+                    node:
+                      description: The node a node principal is for.
+                      nullable: true
+                      type: string
+                    pod:
+                      description: The pod a host principal is for.
+                      nullable: true
+                      type: string
+                  required:
+                  - kvno
+                  - name
+                  type: object
+                type: array
+            type: object
+        required:
+        - spec
+        title: KerberosNodeKeytab
         type: object
     served: true
     storage: true

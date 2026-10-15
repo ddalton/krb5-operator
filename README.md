@@ -108,6 +108,54 @@ Secret. It holds both layouts:
 The cluster domain defaults to `cluster.local`; set the chart's
 `clusterDomain` for anything else.
 
+### Node keytabs for NFS clients
+
+A kernel NFS mount with `sec=krb5`, `krb5i` or `krb5p` is made by the node,
+and the node's `rpc.gssd` takes its machine credential (`host/<node>` or
+`nfs/<node>`) from `/etc/krb5.keytab`. A `KerberosNodeKeytab`
+(cluster-scoped, for cluster administrators) gives each selected node those
+principals and installs their keys:
+
+```yaml
+apiVersion: krb5.ddalton.dev/v1alpha1
+kind: KerberosNodeKeytab
+metadata:
+  name: nfs-clients
+spec:
+  realmRef: corp
+  realmNamespace: auth
+  services: [host, nfs]              # the default
+  nodeSelector:
+    nfs.example.com/kerberos: "true"
+  domain: corp.example.com           # for nodes whose hostname has no dot
+  keytabPath: /etc/krb5.keytab       # the default
+  krb5ConfPath: /etc/krb5.conf.d/corp.conf   # optional
+```
+
+- For every node the selector and `tolerations` let the DaemonSet onto, the
+  operator creates `<service>/<node hostname>` and writes the node's keys
+  to a Secret (`node-keytab-<name>`, in the operator's namespace).
+- A DaemonSet of the same name runs `krb5-operator node-agent` on those
+  nodes. The agent merges the node's keys into `keytabPath`: entries of
+  other realms stay, and this realm's are replaced. Files are written
+  atomically, only when they change. With `krb5ConfPath` it also writes
+  the realm's `krb5.conf` there, naming the KDC by its Service's cluster
+  IP, since nodes do not resolve cluster DNS.
+- A node that goes away or stops being selected has its principals deleted
+  from the KDC, and so does deleting the object (unless
+  `deletionPolicy: Retain`). Keys already on the node stay in its keytab,
+  where they no longer work.
+- Ready means every key got a ticket and the DaemonSet's pod on each node
+  has installed them.
+
+What it does not do: per-user identity. Processes that are not root need
+their own tickets, and node keytabs cover root and the NFS client's own
+state. The nodes need `rpc.gssd` (nfs-utils). The agent runs as root with
+no capabilities and writes through hostPath, so the operator's namespace
+must allow privileged pods (`deploy/operator.yaml` labels it). Every agent
+pod mounts the whole Secret, so select only the nodes that mount with
+Kerberos.
+
 ### One realm, many products
 
 A realm can serve `KerberosPrincipal`s in other namespaces (HDFS in `hdfs`,
