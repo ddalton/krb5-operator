@@ -14,7 +14,15 @@ spec:
     args:
     - |
       rm -f /host/krb5.keytab /host/krb5.conf
-      printf 'addent -password -p someone@OTHER.TEST -k 1 -e aes256-cts-hmac-sha1-96\nsecret\nwkt /host/krb5.keytab\nq\n' | ktutil
+      # someone@OTHER.TEST, kvno 1, aes256-cts-hmac-sha1-96, MIT's format
+      # (0x502), written byte by byte: ktutil wants a terminal.
+      {
+        printf '\005\002\000\000\000\104'                 # version, entry length 68
+        printf '\000\001\000\012OTHER.TEST\000\007someone'  # 1 component, realm, name
+        printf '\000\000\000\001\000\000\000\000\001'        # NT_PRINCIPAL, timestamp, kvno
+        printf '\000\022\000\040'                         # enctype 18, 32 key bytes
+        i=0; while [ $i -lt 32 ]; do printf '\001'; i=$((i+1)); done
+      } > /host/krb5.keytab
       klist -k /host/krb5.keytab
     volumeMounts:
     - name: host
