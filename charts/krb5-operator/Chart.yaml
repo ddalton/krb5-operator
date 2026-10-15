@@ -1,0 +1,10 @@
+apiVersion: v2
+name: krb5-operator
+description: MIT Kerberos realms on Kubernetes — KDCs, principals and keytab Secrets
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/ddalton/krb5-operator
+sources:
+  - https://github.com/ddalton/krb5-operator
+keywords: [kerberos, krb5, kdc, keytab, operator]

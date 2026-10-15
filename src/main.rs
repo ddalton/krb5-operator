@@ -42,7 +42,10 @@ async fn main() -> anyhow::Result<()> {
 
     let client = Client::try_default().await?;
     let realms: Api<KerberosRealm> = Api::all(client.clone());
-    let ctx = Arc::new(realm::Context { client: client.clone() });
+    let ctx = Arc::new(realm::Context {
+        client: client.clone(),
+        kdc_image: std::env::var("KRB5_KDC_IMAGE").unwrap_or_else(|_| crd::DEFAULT_KDC_IMAGE.to_string()),
+    });
     info!("krb5-operator {} starting", env!("CARGO_PKG_VERSION"));
     let realm_controller = Controller::new(realms, watcher::Config::default())
         .owns(Api::<StatefulSet>::all(client.clone()), watcher::Config::default())
@@ -74,10 +77,14 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn deploy_crds_are_current() {
+    fn deploy_and_chart_crds_are_current() {
         assert!(
             include_str!("../deploy/crds.yaml") == super::crds_yaml().unwrap(),
             "deploy/crds.yaml is stale: cargo run -- crds > deploy/crds.yaml"
+        );
+        assert!(
+            include_str!("../charts/krb5-operator/crds/crds.yaml") == super::crds_yaml().unwrap(),
+            "the chart's CRDs are stale: cargo run -- crds > charts/krb5-operator/crds/crds.yaml"
         );
     }
 }

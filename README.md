@@ -62,13 +62,28 @@ Secret.
 
 ## Install
 
+With Helm:
+
+```sh
+helm install krb5-operator charts/krb5-operator --namespace krb5-operator --create-namespace
+```
+
+Helm installs the CRDs only on first install; on upgrade apply
+`charts/krb5-operator/crds/` first (`kubectl apply --server-side -f`).
+Values worth knowing: `image.*` (the operator), `kdcImage.*` (the default
+KDC image for realms that set no `spec.image`: point both at a mirror for
+air-gapped clusters), `imagePullSecrets`, `resources`, `nodeSelector`,
+`tolerations`, `affinity`.
+
+Without Helm (the same objects, rendered from the chart):
+
 ```sh
 kubectl apply --server-side -f deploy/crds.yaml
 kubectl apply -f deploy/operator.yaml
 ```
 
 Images: `ghcr.io/ddalton/krb5-operator` (this repo's `Dockerfile`) and
-`ghcr.io/ddalton/krb5-kdc` (`images/kdc`).
+`ghcr.io/ddalton/krb5-kdc` (`images/kdc`), linux/amd64 and linux/arm64.
 
 ## Tests
 
@@ -76,7 +91,7 @@ Images: `ghcr.io/ddalton/krb5-operator` (this repo's `Dockerfile`) and
   kadmind when `scripts/test-kdc.sh <dir>` has started one
   (`set -a; . <dir>/test.env; set +a` first).
 - `tests/e2e/kind.sh`: builds both images, installs the operator on a kind
-  cluster and runs the Chainsaw tests: a realm comes up, MIT's `kinit` logs
+  cluster with the Helm chart and runs the Chainsaw tests: a realm comes up, MIT's `kinit` logs
   in with the operator's keytab, the database survives the KDC's restart,
   and deleting a `KerberosPrincipal` deletes its principals.
 
