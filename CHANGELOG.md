@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.0 — 2026-10-15
+
+- `KerberosPrincipal.spec.hostPrincipals`: a principal per pod of a
+  StatefulSet, `<service>/<pod>.<serviceName>.<namespace>.svc.<clusterDomain>`
+  for each of `services`, following `spec.replicas`. The Secret holds
+  `krb5.keytab` with every key and `<pod>.keytab` with only that pod's.
+  Scaling down deletes the principals of the pods that are gone (unless
+  `deletionPolicy: Retain`).
+- Principals a `KerberosPrincipal` no longer lists are deleted from the KDC.
+- The cluster domain is set with `CLUSTER_DOMAIN` (the chart's
+  `clusterDomain`, default `cluster.local`).
+- The keytab is verified against the KDC only when its keys change or the
+  principal was not `Ready`; status is written only when it changes.
+- krb5 0.9.
+
 ## 0.1.2 — 2026-10-15
 
 - Security: a `KerberosPrincipal` could get the keys of any principal
