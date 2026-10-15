@@ -1,0 +1,9 @@
+apiVersion: krb5.ddalton.dev/v1alpha1
+kind: KerberosPrincipal
+metadata:
+  name: web
+spec:
+  realmRef: hosts
+  hostPrincipals:
+    statefulSet: web
+    services: [HTTP, host]

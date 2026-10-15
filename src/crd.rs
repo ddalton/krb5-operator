@@ -145,7 +145,12 @@ pub struct KerberosPrincipalSpec {
     pub realm_namespace: Option<String>,
     /// Principal names (`nn/host.example.com`): the realm is appended, or,
     /// if given (`...@REALM`), must be the realm's.
+    #[serde(default)]
     pub principals: Vec<String>,
+    /// Host principals for every pod of a StatefulSet, following its
+    /// replicas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_principals: Option<HostPrincipals>,
     /// The Secret to write the keytab to (default: this object's name).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_name: Option<String>,
@@ -155,6 +160,21 @@ pub struct KerberosPrincipalSpec {
     /// `Delete` (default) or `Retain` the principals when this is deleted.
     #[serde(default)]
     pub deletion_policy: DeletionPolicy,
+}
+
+/// `<service>/<pod FQDN>` for each service and each pod of a StatefulSet
+/// (`dn/pillar-dn-0.pillar-dn.hdfs.svc.cluster.local`), as Hadoop's
+/// `dn/_HOST` names them. The keytab Secret holds every pod's keys
+/// (`krb5.keytab`) and each pod's own (`<pod>.keytab`, for a
+/// `subPathExpr: $(POD_NAME).keytab` mount).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HostPrincipals {
+    /// The StatefulSet (this object's namespace); its `serviceName` gives
+    /// the pods their DNS names.
+    pub stateful_set: String,
+    /// Service names (`dn`, `HTTP`).
+    pub services: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
@@ -177,6 +197,9 @@ pub struct KerberosPrincipalStatus {
 pub struct PrincipalStatus {
     pub name: String,
     pub kvno: u32,
+    /// The pod a host principal is for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod: Option<String>,
 }
 
 impl KerberosPrincipal {

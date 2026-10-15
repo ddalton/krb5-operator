@@ -62,6 +62,52 @@ rewritten only when the keys change. `Ready` means every principal got a
 ticket with its key from the keytab. Deleting the object deletes the
 principals (unless `Retain`) and the Secret.
 
+### Host principals for a StatefulSet
+
+Hadoop, NFS and most Kerberized services want one principal per host
+(`dn/_HOST@REALM`). `hostPrincipals` makes `<service>/<pod FQDN>` for every
+pod of a StatefulSet and follows its `replicas`:
+
+```yaml
+kind: KerberosPrincipal
+metadata: { name: datanodes, namespace: hdfs }
+spec:
+  realmRef: corp
+  hostPrincipals:
+    statefulSet: pillar-dn      # its serviceName gives the pods DNS names
+    services: [dn, HTTP]        # dn/pillar-dn-0.pillar-dn.hdfs.svc.cluster.local, ...
+```
+
+The operator watches the StatefulSet. On a scale-up it creates the new pods'
+principals from `spec.replicas`, so the keys are there by the time the pods
+start. On a scale-down, or when a name leaves the spec, it deletes the
+principals that are no longer wanted (only its own, and not with
+`deletionPolicy: Retain`).
+
+A StatefulSet's pods share one pod template, so they all mount the same
+Secret. It holds both layouts:
+
+- `krb5.keytab`: every pod's keys. Hadoop's `_HOST` substitution picks the
+  pod's own key from it.
+- `<pod>.keytab`: only that pod's keys. To keep the other pods' keys out of
+  the container, mount just its own file:
+
+  ```yaml
+  env:
+  - name: POD_NAME
+    valueFrom: { fieldRef: { fieldPath: metadata.name } }
+  volumeMounts:
+  - name: krb5
+    mountPath: /etc/security/keytab
+    subPathExpr: $(POD_NAME).keytab
+  ```
+
+  Kubernetes does not update `subPath` mounts, so a rotated key reaches the
+  pod when it restarts. A mount of the whole Secret updates in place.
+
+The cluster domain defaults to `cluster.local`; set the chart's
+`clusterDomain` for anything else.
+
 ### One realm, many products
 
 A realm can serve `KerberosPrincipal`s in other namespaces (HDFS in `hdfs`,

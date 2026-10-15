@@ -42,6 +42,8 @@ spec:
           env:
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
+            - name: CLUSTER_DOMAIN
+              value: {{ .Values.clusterDomain | quote }}
             - name: KRB5_KDC_IMAGE
               value: "{{ .Values.kdcImage.repository }}:{{ .Values.kdcImage.tag | default .Chart.AppVersion }}"
           resources:

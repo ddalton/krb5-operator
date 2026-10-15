@@ -1,0 +1,58 @@
+# Each pod logs in as HTTP/<its own FQDN> with its own keytab
+# (<pod>.keytab), read from the Secret's directory so a key added by a
+# scale-up reaches a pod that started before it; ready once it has.
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  clusterIP: None
+  selector:
+    app: web
+  ports:
+  - port: 80
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: web
+spec:
+  serviceName: web
+  replicas: 2
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+      - name: web
+        image: krb5-kdc:e2e
+        imagePullPolicy: Never
+        command: [sh, -euc]
+        args:
+        - |
+          me=$(hostname -f)
+          until KRB5_CONFIG=/krb5/krb5.conf kinit -k -t "/krb5/$(hostname).keytab" "HTTP/$me" 2>/tmp/err; do
+            cat /tmp/err; sleep 2
+          done
+          klist
+          touch /tmp/ready
+          exec sleep infinity
+        env:
+        - name: KRB5CCNAME
+          value: FILE:/tmp/cc
+        readinessProbe:
+          exec:
+            command: [test, -e, /tmp/ready]
+          periodSeconds: 2
+        volumeMounts:
+        - name: krb5
+          mountPath: /krb5
+      volumes:
+      - name: krb5
+        secret:
+          secretName: web

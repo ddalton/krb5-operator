@@ -14,6 +14,10 @@ kdcImage:
 
 imagePullSecrets: []
 
+# The cluster's DNS domain: host principals name pods
+# <pod>.<service>.<namespace>.svc.<clusterDomain>.
+clusterDomain: cluster.local
+
 # RUST_LOG for the operator.
 logLevel: info,krb5=warn
 

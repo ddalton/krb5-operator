@@ -1,0 +1,7 @@
+apiVersion: krb5.ddalton.dev/v1alpha1
+kind: KerberosRealm
+metadata:
+  name: hosts
+spec:
+  realm: HOSTS.TEST
+  storage: 100Mi

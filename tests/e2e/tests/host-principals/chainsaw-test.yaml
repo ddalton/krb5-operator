@@ -1,0 +1,112 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/kyverno/chainsaw/v0.2.15/.schemas/json/test-chainsaw-v1alpha1.json
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: host-principals
+spec:
+  description: >-
+    hostPrincipals make <service>/<pod FQDN> for every pod of a StatefulSet;
+    each pod logs in as HTTP/$(hostname -f) with its own <pod>.keytab;
+    scaling up adds a pod's principals, scaling down deletes them.
+  steps:
+  - name: realm
+    try:
+    - apply:
+        file: realm.yaml
+    - assert:
+        resource:
+          apiVersion: krb5.ddalton.dev/v1alpha1
+          kind: KerberosRealm
+          metadata:
+            name: hosts
+          status:
+            (conditions[?type == 'Ready']):
+            - status: "True"
+  - name: pods-log-in-as-themselves
+    try:
+    - apply:
+        file: principals.yaml
+    - apply:
+        file: web.yaml
+    - assert:
+        resource:
+          apiVersion: krb5.ddalton.dev/v1alpha1
+          kind: KerberosPrincipal
+          metadata:
+            name: web
+          status:
+            (length(principals)): 4
+            (conditions[?type == 'Ready']):
+            - status: "True"
+    - assert:
+        resource:
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: web
+          status:
+            readyReplicas: 2
+    - script:
+        content: |
+          set -eux
+          # Each pod's keytab holds its keys and no one else's.
+          for i in 0 1; do
+            kubectl -n "$NAMESPACE" exec web-$i -- sh -c 'klist -k /krb5/$(hostname).keytab' > keys-$i
+            grep -q "HTTP/web-$i.web.$NAMESPACE.svc.cluster.local@HOSTS.TEST" keys-$i
+            grep -q "host/web-$i.web.$NAMESPACE.svc.cluster.local@HOSTS.TEST" keys-$i
+            # (not "! grep": under set -e that never fails)
+            if grep -q "web-$((1 - i))\." keys-$i; then exit 1; fi
+          done
+    catch:
+    - podLogs:
+        selector: app=web
+  - name: scale-up-adds-a-pods-principals
+    try:
+    - script:
+        content: kubectl -n "$NAMESPACE" scale statefulset web --replicas=3
+    - assert:
+        resource:
+          apiVersion: krb5.ddalton.dev/v1alpha1
+          kind: KerberosPrincipal
+          metadata:
+            name: web
+          status:
+            (length(principals)): 6
+            (conditions[?type == 'Ready']):
+            - status: "True"
+    - assert:
+        resource:
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: web
+          status:
+            readyReplicas: 3
+    catch:
+    - podLogs:
+        selector: app=web
+  - name: scale-down-deletes-them
+    try:
+    - script:
+        content: kubectl -n "$NAMESPACE" scale statefulset web --replicas=1
+    - assert:
+        resource:
+          apiVersion: krb5.ddalton.dev/v1alpha1
+          kind: KerberosPrincipal
+          metadata:
+            name: web
+          status:
+            (length(principals)): 2
+    - script:
+        content: |
+          set -eux
+          kdc() { kubectl -n "$NAMESPACE" exec hosts-kdc-0 -- kadmin.local -r HOSTS.TEST -q "$1" 2>&1; }
+          for i in 1 2; do
+            for s in HTTP host; do
+              kdc "getprinc $s/web-$i.web.$NAMESPACE.svc.cluster.local" | grep -q 'does not exist'
+            done
+          done
+          kdc "getprinc HTTP/web-0.web.$NAMESPACE.svc.cluster.local" | grep -q '^Principal:'
+          keys=$(kubectl -n "$NAMESPACE" get secret web -o jsonpath='{.data}')
+          echo "$keys" | grep -q '"web-0.keytab"'
+          if echo "$keys" | grep -q '"web-1.keytab"'; then exit 1; fi

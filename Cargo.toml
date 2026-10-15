@@ -10,8 +10,7 @@ repository = "https://github.com/ddalton/krb5-operator"
 kube = { version = "4.2", default-features = false, features = ["client", "rustls-tls", "ring", "runtime", "derive"] }
 k8s-openapi = { version = "0.28", features = ["v1_32", "schemars"] }
 schemars = "1"
-# kadmin: krb5 0.8 (git until it is on crates.io)
-krb5 = { git = "https://github.com/ddalton/krb5", rev = "a2b0873" }
+krb5 = "0.9"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
