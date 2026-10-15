@@ -61,10 +61,10 @@ use crate::crd::{
 };
 use crate::realm;
 
-const MANAGER: &str = "krb5-operator";
+pub const MANAGER: &str = "krb5-operator";
 const FINALIZER: &str = "krb5.ddalton.dev/principals";
 /// The Secret's annotation with [`fingerprint`] of the keys in its keytab.
-const KEYS_SHA256: &str = "krb5.ddalton.dev/keys-sha256";
+pub const KEYS_SHA256: &str = "krb5.ddalton.dev/keys-sha256";
 /// The string attribute naming a principal's owner in the KDC.
 pub const OWNER_ATTR: &str = "krb5-operator/owner";
 /// The Secret's key for the realm's client configuration.
@@ -93,7 +93,7 @@ pub enum Error {
 impl Error {
     /// For a condition: what is wrong with the object, not with the
     /// operator or the cluster.
-    fn reason(&self) -> Option<&'static str> {
+    pub fn reason(&self) -> Option<&'static str> {
         match self {
             Error::Invalid(_) => Some("Invalid"),
             Error::Conflict(_) => Some("Conflict"),
@@ -231,13 +231,15 @@ pub fn secret_files(
 
 /// Principals `kp` had (its status) that it no longer wants.
 pub fn unwanted(kp: &KerberosPrincipal, wanted: &[Wanted]) -> Vec<Principal> {
-    let names: Vec<String> = wanted.iter().map(|w| format!("{}@{}", w.principal.name(), w.principal.realm)).collect();
-    kp.status
-        .iter()
-        .flat_map(|s| &s.principals)
-        .filter(|p| !names.contains(&p.name))
-        .filter_map(|p| Principal::parse(&p.name).ok())
-        .collect()
+    let had = kp.status.as_ref().map(|s| s.principals.as_slice()).unwrap_or_default();
+    let wanted: Vec<&Principal> = wanted.iter().map(|w| &w.principal).collect();
+    no_longer_wanted(had, &wanted)
+}
+
+/// Of the principals in a status (`had`), those not `wanted`.
+pub fn no_longer_wanted(had: &[PrincipalStatus], wanted: &[&Principal]) -> Vec<Principal> {
+    let names: Vec<String> = wanted.iter().map(|p| format!("{}@{}", p.name(), p.realm)).collect();
+    had.iter().filter(|p| !names.contains(&p.name)).filter_map(|p| Principal::parse(&p.name).ok()).collect()
 }
 
 /// The KDC's, kadmind's and the operator's own principals: whoever has
@@ -453,20 +455,26 @@ async fn admin_for(
             )));
         }
     }
+    let admin = admin_of(client, &r).await?;
+    Ok((r, admin))
+}
+
+/// How to administer realm `r`, once it is ready.
+pub async fn admin_of(client: &Client, r: &KerberosRealm) -> Result<Admin, Error> {
+    let name = format!("{}/{}", r.namespace().unwrap_or_default(), r.name_any());
     let status = r.status.clone().unwrap_or_default();
     let ready = status.conditions.iter().any(|c| c.type_ == "Ready" && c.status == "True");
     let (Some(kdc), Some(admin_server), true) = (status.kdc, status.admin_server, ready) else {
-        return Err(Error::RealmNotReady(realm_ref(kp), "its KDC does not answer yet".into()));
+        return Err(Error::RealmNotReady(name, "its KDC does not answer yet".into()));
     };
-    let password = realm::admin_password(client, &r)
+    let password = realm::admin_password(client, r)
         .await
-        .map_err(|e| Error::RealmNotReady(realm_ref(kp), e.to_string()))?
-        .ok_or_else(|| Error::RealmNotReady(realm_ref(kp), "no admin password".into()))?;
-    let realm = r.spec.realm.clone();
-    Ok((r, Admin { realm, kdc, admin_server, password }))
+        .map_err(|e| Error::RealmNotReady(name.clone(), e.to_string()))?
+        .ok_or_else(|| Error::RealmNotReady(name, "no admin password".into()))?;
+    Ok(Admin { realm: r.spec.realm.clone(), kdc, admin_server, password })
 }
 
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, Error> {
+pub async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, Error> {
     tokio::task::spawn_blocking(f).await.map_err(|e| Error::Kadmin(e.to_string()))
 }
 
@@ -489,7 +497,7 @@ pub fn secret(kp: &KerberosPrincipal, files: BTreeMap<String, Vec<u8>>, fingerpr
     }
 }
 
-fn condition(ready: bool, reason: &str, message: &str) -> Condition {
+pub fn condition(ready: bool, reason: &str, message: &str) -> Condition {
     Condition {
         type_: "Ready".into(),
         status: if ready { "True" } else { "False" }.into(),
@@ -614,6 +622,7 @@ async fn sync(kp: &KerberosPrincipal, ctx: &Context) -> Result<Action, Error> {
                 name: format!("{}@{}", p.name(), p.realm),
                 kvno: ks.iter().map(|(v, _)| *v).max().unwrap_or(0),
                 pod: w.pod.clone(),
+                node: None,
             })
             .collect(),
         conditions: vec![cond],
@@ -955,6 +964,7 @@ mod tests {
                     name: format!("{}@{}", w.principal.name(), w.principal.realm),
                     kvno: 1,
                     pod: w.pod.clone(),
+                    node: None,
                 })
                 .collect(),
             ..Default::default()

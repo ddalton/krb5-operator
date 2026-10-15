@@ -1,0 +1,143 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/kyverno/chainsaw/v0.2.15/.schemas/json/test-chainsaw-v1alpha1.json
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: node-keytab
+spec:
+  description: >-
+    A KerberosNodeKeytab gives the labelled node host/ and nfs/ principals,
+    and its DaemonSet merges their keys into the node's keytab, keeping
+    another realm's entry there, with a krb5.conf that reaches the KDC by
+    cluster IP: from the host network with the host's resolver, kinit works
+    with each key. Unlabelled, the node's principals are deleted.
+  steps:
+  - name: realm-and-seed
+    try:
+    - apply:
+        file: realm.yaml
+    - apply:
+        file: seed.yaml
+    - assert:
+        resource:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: seed
+          status:
+            phase: Succeeded
+    - assert:
+        resource:
+          apiVersion: krb5.ddalton.dev/v1alpha1
+          kind: KerberosRealm
+          metadata:
+            name: nodes
+          status:
+            (conditions[?type == 'Ready']):
+            - status: "True"
+  - name: node-keytab
+    try:
+    # realmNamespace is the test's own namespace, known only at run time.
+    - script:
+        content: |
+          set -eu
+          node=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
+          kubectl label node "$node" krb5-e2e=yes --overwrite
+          cat <<YAML | kubectl apply -f -
+          apiVersion: krb5.ddalton.dev/v1alpha1
+          kind: KerberosNodeKeytab
+          metadata:
+            name: e2e-nodes
+          spec:
+            realmRef: nodes
+            realmNamespace: $NAMESPACE
+            domain: e2e.test
+            nodeSelector:
+              krb5-e2e: "yes"
+            tolerations:
+            - key: node-role.kubernetes.io/control-plane
+              operator: Exists
+              effect: NoSchedule
+            keytabPath: /var/lib/krb5-e2e/krb5.keytab
+            krb5ConfPath: /var/lib/krb5-e2e/krb5.conf
+          YAML
+    - assert:
+        resource:
+          apiVersion: krb5.ddalton.dev/v1alpha1
+          kind: KerberosNodeKeytab
+          metadata:
+            name: e2e-nodes
+          status:
+            nodes: 1
+            (conditions[?type == 'Ready']):
+            - status: "True"
+              reason: Installed
+    - apply:
+        file: check.yaml
+    - assert:
+        resource:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: check
+          status:
+            phase: Running
+    - script:
+        content: |
+          kubectl -n "$NAMESPACE" exec -i check -- bash -s <<'SCRIPT'
+          set -euxo pipefail
+          host=$(hostname).e2e.test
+          klist -k /host/krb5.keytab | tee /tmp/kt
+          grep -q 'someone@OTHER.TEST' /tmp/kt          # another realm's entry kept
+          grep -q "host/$host@NODES.TEST" /tmp/kt
+          grep -q "nfs/$host@NODES.TEST" /tmp/kt
+          grep -q 'kdc = [0-9]' /host/krb5.conf        # the KDC by cluster IP
+          for svc in host nfs; do
+            kinit -k -t /host/krb5.keytab "$svc/$host@NODES.TEST"
+            klist
+            kdestroy
+          done
+          echo PASS
+          SCRIPT
+    - script:
+        content: |
+          set -eu
+          s=$(kubectl -n krb5-operator get secret node-keytab-e2e-nodes -o jsonpath='{.data}')
+          node=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
+          echo "$s" | grep -q "\"$node.keytab\""
+          echo "$s" | grep -q '"krb5.conf"'
+  - name: unlabel
+    try:
+    - script:
+        content: |
+          set -eu
+          node=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
+          kubectl label node "$node" krb5-e2e-
+    - assert:
+        resource:
+          apiVersion: krb5.ddalton.dev/v1alpha1
+          kind: KerberosNodeKeytab
+          metadata:
+            name: e2e-nodes
+          status:
+            nodes: 0
+            (conditions[?type == 'Ready']):
+            - status: "True"
+    - script:
+        content: |
+          kubectl -n "$NAMESPACE" exec -i check -- bash -s <<'SCRIPT'
+          set -uxo pipefail
+          host=$(hostname).e2e.test
+          # The keys are still in the file, but the principals are gone.
+          if kinit -k -t /host/krb5.keytab "host/$host@NODES.TEST" 2>/tmp/err; then
+            echo "FAIL: host/$host still in the KDC"; exit 1
+          fi
+          cat /tmp/err
+          grep -qi 'not found' /tmp/err
+          echo PASS
+          SCRIPT
+    finally:
+    - script:
+        content: |
+          kubectl delete kerberosnodekeytab e2e-nodes --wait --timeout=60s || true
+          node=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
+          kubectl label node "$node" krb5-e2e- || true

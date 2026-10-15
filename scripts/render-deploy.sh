@@ -10,5 +10,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
   echo "kind: Namespace"
   echo "metadata:"
   echo "  name: krb5-operator"
+  echo "  labels:"
+  echo "    # KerberosNodeKeytab agents write host files (hostPath, root)."
+  echo "    pod-security.kubernetes.io/enforce: privileged"
   helm template krb5-operator "$ROOT/charts/krb5-operator" --namespace krb5-operator
 } >"$ROOT/deploy/operator.yaml"

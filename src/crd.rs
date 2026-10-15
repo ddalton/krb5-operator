@@ -4,6 +4,8 @@
 //! operator runs: a StatefulSet with the database on a volume, its master
 //! key in a Secret, and a Service clients reach it through.
 
+use std::collections::BTreeMap;
+
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -200,6 +202,9 @@ pub struct PrincipalStatus {
     /// The pod a host principal is for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod: Option<String>,
+    /// The node a node principal is for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
 }
 
 impl KerberosPrincipal {
@@ -227,5 +232,92 @@ impl KerberosPrincipal {
 
     pub fn keytab_key(&self) -> String {
         self.spec.keytab_key.clone().unwrap_or_else(|| "krb5.keytab".into())
+    }
+}
+
+/// Host keytabs for nodes: `<service>/<node hostname>` for each selected
+/// node, installed into the node's keytab (`/etc/krb5.keytab`) by a
+/// DaemonSet in the operator's namespace. What the kernel's NFS client
+/// (rpc.gssd) needs for `sec=krb5*` mounts.
+///
+/// Cluster-scoped: it has the operator write files on nodes, which is for
+/// cluster administrators to ask for.
+#[derive(CustomResource, Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+#[kube(
+    group = "krb5.ddalton.dev",
+    version = "v1alpha1",
+    kind = "KerberosNodeKeytab",
+    status = "KerberosNodeKeytabStatus",
+    shortname = "knk",
+    printcolumn = r#"{"name":"Realm","type":"string","jsonPath":".spec.realmRef"}"#,
+    printcolumn = r#"{"name":"Nodes","type":"integer","jsonPath":".status.nodes"}"#,
+    printcolumn = r#"{"name":"Ready","type":"string","jsonPath":".status.conditions[?(@.type==\"Ready\")].status"}"#
+)]
+#[serde(rename_all = "camelCase")]
+pub struct KerberosNodeKeytabSpec {
+    /// The `KerberosRealm` the principals belong to.
+    pub realm_ref: String,
+    /// Its namespace.
+    pub realm_namespace: String,
+    /// Service names (default `host`, `nfs`): `<service>/<node hostname>`.
+    #[serde(default = "default_node_services")]
+    pub services: Vec<String>,
+    /// The nodes (labels they must have; default: every node whose taints
+    /// `tolerations` tolerate).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_selector: Option<BTreeMap<String, String>>,
+    /// Tolerations for the DaemonSet, and so for which nodes get keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tolerations: Option<Vec<k8s_openapi::api::core::v1::Toleration>>,
+    /// Appended to a node hostname without a dot (`worker1` →
+    /// `worker1.example.com`); the name must be what the node calls itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// The keytab on the node (default `/etc/krb5.keytab`). Entries of
+    /// other realms in it are kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keytab_path: Option<String>,
+    /// Also write a `krb5.conf` for the realm there (the KDC by its
+    /// Service's cluster IP: nodes do not resolve cluster DNS), e.g.
+    /// `/etc/krb5.conf.d/krb5-operator.conf`. Default: none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub krb5_conf_path: Option<String>,
+    /// `Delete` (default) or `Retain` the principals when this is deleted.
+    #[serde(default)]
+    pub deletion_policy: DeletionPolicy,
+}
+
+fn default_node_services() -> Vec<String> {
+    vec!["host".into(), "nfs".into()]
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct KerberosNodeKeytabStatus {
+    /// How many nodes have keys.
+    #[serde(default)]
+    pub nodes: u32,
+    #[serde(default)]
+    pub principals: Vec<PrincipalStatus>,
+    #[serde(default)]
+    pub conditions: Vec<Condition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
+}
+
+impl KerberosNodeKeytab {
+    /// What it is called as the owner of its principals in the KDC (no
+    /// namespace is upper case, so no `KerberosPrincipal` is called this).
+    pub fn owner(&self) -> String {
+        format!("KerberosNodeKeytab/{}", self.metadata.name.as_deref().unwrap_or(""))
+    }
+
+    /// The Secret and DaemonSet in the operator's namespace.
+    pub fn object_name(&self) -> String {
+        format!("node-keytab-{}", self.metadata.name.as_deref().unwrap_or(""))
+    }
+
+    pub fn keytab_path(&self) -> String {
+        self.spec.keytab_path.clone().unwrap_or_else(|| "/etc/krb5.keytab".into())
     }
 }

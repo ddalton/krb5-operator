@@ -62,7 +62,7 @@ helm install krb5-operator "$ROOT/charts/krb5-operator" --namespace krb5-operato
   --set image.repository=krb5-operator --set image.tag=e2e --set image.pullPolicy=Never \
   --set kdcImage.repository=krb5-kdc --set kdcImage.tag=e2e \
   --wait --timeout 120s
-kubectl wait --for=condition=Established crd/kerberosrealms.krb5.ddalton.dev crd/kerberosprincipals.krb5.ddalton.dev
+kubectl wait --for=condition=Established crd/kerberosrealms.krb5.ddalton.dev crd/kerberosprincipals.krb5.ddalton.dev crd/kerberosnodekeytabs.krb5.ddalton.dev
 
 TESTS="${TESTS:-tests}"
 step "chainsaw: $TESTS"

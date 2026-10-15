@@ -1,0 +1,29 @@
+# The node's view: host network, the host's resolver (no cluster DNS), the
+# host directory the agent wrote. Idle until the test execs kinit in it.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: check
+spec:
+  hostNetwork: true
+  dnsPolicy: Default
+  terminationGracePeriodSeconds: 1
+  containers:
+  - name: check
+    image: krb5-kdc:e2e
+    imagePullPolicy: Never
+    command: [sleep, infinity]
+    env:
+    - name: KRB5_CONFIG
+      value: /host/krb5.conf
+    - name: KRB5CCNAME
+      value: FILE:/tmp/cc
+    volumeMounts:
+    - name: host
+      mountPath: /host
+      readOnly: true
+  volumes:
+  - name: host
+    hostPath:
+      path: /var/lib/krb5-e2e
+      type: Directory
