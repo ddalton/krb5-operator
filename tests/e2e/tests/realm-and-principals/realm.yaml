@@ -2,7 +2,7 @@ apiVersion: krb5.ddalton.dev/v1alpha1
 kind: KerberosRealm
 metadata:
   name: corp
+# No image: the operator's default (the chart's kdcImage, krb5-kdc:e2e).
 spec:
   realm: CORP.TEST
-  image: krb5-kdc:e2e
   storage: 100Mi

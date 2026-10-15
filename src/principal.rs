@@ -6,7 +6,10 @@
 //! principals that are missing (random keys, `addprinc -randkey`), and
 //! extracts their current keys (`ktadd -norandkey`), so the keytab follows
 //! the KDC: a key changed there reaches the Secret, and a reconcile never
-//! changes a key itself. The Secret is written only when its bytes differ.
+//! changes a key itself. The Secret is written only when the keys differ:
+//! it carries a SHA-256 of them (`krb5.ddalton.dev/keys-sha256`), since the
+//! keytab's own bytes hold the time each entry was written and so differ
+//! at every reconcile.
 //!
 //! Ready means the keytab works: an AS exchange with each principal's key
 //! from the keytab gets a ticket.
@@ -38,6 +41,8 @@ use crate::realm;
 
 const MANAGER: &str = "krb5-operator";
 const FINALIZER: &str = "krb5.ddalton.dev/principals";
+/// The Secret's annotation with [`fingerprint`] of the keys in its keytab.
+const KEYS_SHA256: &str = "krb5.ddalton.dev/keys-sha256";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -99,6 +104,27 @@ pub fn keytab(keys: &[PrincipalKeys]) -> Keytab {
         }
     }
     Keytab::from_keys(entries)
+}
+
+/// SHA-256 over every principal, kvno, enctype and key, in order: equal
+/// exactly when the keytabs would hold the same keys.
+pub fn fingerprint(keys: &[PrincipalKeys]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    let field = |h: &mut Sha256, b: &[u8]| {
+        h.update((b.len() as u32).to_be_bytes());
+        h.update(b);
+    };
+    for (p, ks) in keys {
+        field(&mut h, format!("{}@{}", p.name(), p.realm).as_bytes());
+        h.update((ks.len() as u32).to_be_bytes());
+        for (kvno, k) in ks {
+            h.update(kvno.to_be_bytes());
+            h.update(k.enctype().to_be_bytes());
+            field(&mut h, k.bytes());
+        }
+    }
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Where and as whom the operator administers a realm.
@@ -190,7 +216,7 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
     tokio::task::spawn_blocking(f).await.map_err(|e| Error::Kadmin(e.to_string()))
 }
 
-pub fn secret(kp: &KerberosPrincipal, keytab: Vec<u8>) -> Secret {
+pub fn secret(kp: &KerberosPrincipal, keytab: Vec<u8>, fingerprint: &str) -> Secret {
     Secret {
         metadata: ObjectMeta {
             name: Some(kp.secret_name()),
@@ -199,6 +225,7 @@ pub fn secret(kp: &KerberosPrincipal, keytab: Vec<u8>) -> Secret {
                 ("app.kubernetes.io/managed-by".to_string(), MANAGER.to_string()),
                 ("krb5.ddalton.dev/principal".to_string(), kp.name_any()),
             ])),
+            annotations: Some(BTreeMap::from([(KEYS_SHA256.to_string(), fingerprint.to_string())])),
             owner_references: Some(vec![kp.controller_owner_ref(&()).expect("a stored KerberosPrincipal has a uid")]),
             ..Default::default()
         },
@@ -246,19 +273,19 @@ async fn apply(kp: Arc<KerberosPrincipal>, client: &Client) -> Result<Action, Er
         blocking(move || admin.ensure(&ps)).await??
     };
     let kt = keytab(&keys);
-    let bytes = kt.to_bytes();
+    let fp = fingerprint(&keys);
 
     let ns = kp.namespace().unwrap_or_else(|| "default".into());
     let secrets: Api<Secret> = Api::namespaced(client.clone(), &ns);
     let name = kp.secret_name();
     let current = secrets.get_opt(&name).await?;
-    let unchanged = current
-        .as_ref()
-        .and_then(|s| s.data.as_ref())
-        .and_then(|d| d.get(&kp.keytab_key()))
-        .is_some_and(|b| b.0 == bytes);
+    let unchanged = current.as_ref().is_some_and(|s| {
+        s.annotations().get(KEYS_SHA256) == Some(&fp)
+            && s.data.as_ref().is_some_and(|d| d.get(&kp.keytab_key()).is_some_and(|b| !b.0.is_empty()))
+    });
     if !unchanged {
-        secrets.patch(&name, &PatchParams::apply(MANAGER).force(), &Patch::Apply(&secret(&kp, bytes))).await?;
+        let s = secret(&kp, kt.to_bytes(), &fp);
+        secrets.patch(&name, &PatchParams::apply(MANAGER).force(), &Patch::Apply(&s)).await?;
         info!("Wrote the keytab of {} to Secret {}/{}", kp.name_any(), ns, name);
     }
 
@@ -359,11 +386,15 @@ mod tests {
         let e = kt.find_key("nn/host").unwrap();
         assert_eq!((e.kvno, e.realm.as_str()), (2, "CORP.TEST"));
         assert_eq!(kt.find_key("dn/host").unwrap().kvno, 5);
-        // The same keys make the same bytes, so an unchanged keytab is not
-        // rewritten; a new key changes them.
-        assert_eq!(kt.to_bytes(), keytab(&keys).to_bytes());
-        let rotated = vec![(nn, vec![(3, k(18, 9))]), (dn, vec![(5, k(18, 3))])];
-        assert_ne!(kt.to_bytes(), keytab(&rotated).to_bytes());
+        // The same keys have the same fingerprint, so an unchanged keytab is
+        // not rewritten; a new key, kvno or principal changes it.
+        assert_eq!(fingerprint(&keys), fingerprint(&keys.clone()));
+        assert_eq!(fingerprint(&keys).len(), 64);
+        let rotated = vec![(nn.clone(), vec![(3, k(18, 9))]), (dn.clone(), vec![(5, k(18, 3))])];
+        assert_ne!(fingerprint(&keys), fingerprint(&rotated));
+        let rekvno = vec![(nn.clone(), vec![(3, k(18, 1)), (3, k(17, 2))]), (dn.clone(), vec![(5, k(18, 3))])];
+        assert_ne!(fingerprint(&keys), fingerprint(&rekvno));
+        assert_ne!(fingerprint(&keys), fingerprint(&keys[..1]));
         // MIT's keytab format.
         assert_eq!(&kt.to_bytes()[..2], &[5, 2]);
     }
@@ -376,13 +407,14 @@ mod tests {
         );
         kp.metadata.namespace = Some("hdfs".into());
         kp.metadata.uid = Some("u-2".into());
-        let s = secret(&kp, vec![5, 2]);
+        let s = secret(&kp, vec![5, 2], "ab");
+        assert_eq!(s.metadata.annotations.as_ref().unwrap()[KEYS_SHA256], "ab");
         assert_eq!(s.metadata.name.as_deref(), Some("pillar-nn"));
         assert_eq!(s.metadata.owner_references.unwrap()[0].uid, "u-2");
         assert_eq!(s.data.unwrap()["krb5.keytab"].0, vec![5, 2]);
         kp.spec.secret_name = Some("nn-keytab".into());
         kp.spec.keytab_key = Some("nn.keytab".into());
-        let s = secret(&kp, vec![]);
+        let s = secret(&kp, vec![], "ab");
         assert_eq!(s.metadata.name.as_deref(), Some("nn-keytab"));
         assert!(s.data.unwrap().contains_key("nn.keytab"));
         assert_eq!(kp.spec.deletion_policy, DeletionPolicy::Delete);
@@ -432,7 +464,7 @@ mod tests {
         // Again: nothing is created and no key changes, so the Secret is
         // left alone.
         let again = admin.ensure(&ps).unwrap();
-        assert_eq!(keytab(&again).to_bytes(), kt.to_bytes());
+        assert_eq!(fingerprint(&again), fingerprint(&keys));
         admin.delete(&ps).unwrap();
     }
 
@@ -440,7 +472,8 @@ mod tests {
     fn live_a_key_changed_in_the_kdc_reaches_the_keytab() {
         let admin = live_or_skip!();
         let ps = principals(&[unique("rotated")], &admin.realm).unwrap();
-        let old = keytab(&admin.ensure(&ps).unwrap());
+        let first = admin.ensure(&ps).unwrap();
+        let old = keytab(&first);
         let mut kadm = admin.connect().unwrap();
         kadm.randomize_keys(&ps[0]).unwrap();
         kadm.close();
@@ -451,7 +484,7 @@ mod tests {
             "kvno 2: {:?}",
             keys[0].1.iter().map(|(v, _)| v).collect::<Vec<_>>()
         );
-        assert_ne!(new.to_bytes(), old.to_bytes());
+        assert_ne!(fingerprint(&keys), fingerprint(&first));
         admin.verify(&ps, &new).unwrap();
         assert!(admin.verify(&ps, &old).is_err(), "the old keytab no longer works");
         admin.delete(&ps).unwrap();

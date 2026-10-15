@@ -1,4 +1,4 @@
-# fmt, clippy, and the tests, the live ones (principal.rs, `live_`) against
+# fmt, clippy, the Helm chart, and the tests, the live ones (principal.rs, `live_`) against
 # an MIT KDC and kadmind set up as the KDC image sets up a realm.
 name: ci
 
@@ -23,6 +23,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      - name: helm lint, deploy/operator.yaml rendered from the chart
+        run: |
+          helm lint --strict charts/krb5-operator
+          scripts/render-deploy.sh
+          git diff --exit-code deploy/operator.yaml
       - run: |
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq krb5-kdc krb5-admin-server

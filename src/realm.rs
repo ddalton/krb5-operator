@@ -37,7 +37,7 @@ use rand::Rng;
 use serde_json::json;
 use tracing::{info, warn};
 
-use crate::crd::{Condition, DEFAULT_KDC_IMAGE, KerberosRealm, KerberosRealmStatus};
+use crate::crd::{Condition, KerberosRealm, KerberosRealmStatus};
 
 pub const KDC_PORT: i32 = 88;
 pub const KADMIN_PORT: i32 = 749;
@@ -57,6 +57,9 @@ pub enum Error {
 
 pub struct Context {
     pub client: Client,
+    /// The KDC image for realms that do not name one (`KRB5_KDC_IMAGE`,
+    /// else [`crate::crd::DEFAULT_KDC_IMAGE`]).
+    pub kdc_image: String,
 }
 
 /// Labels on every object of a realm.
@@ -155,10 +158,10 @@ pub async fn admin_password(client: &Client, realm: &KerberosRealm) -> Result<Op
         .and_then(|b| String::from_utf8(b.0).ok()))
 }
 
-pub fn stateful_set(realm: &KerberosRealm) -> StatefulSet {
+pub fn stateful_set(realm: &KerberosRealm, default_image: &str) -> StatefulSet {
     let name = realm.base_name();
     let labels = labels(realm);
-    let image = realm.spec.image.clone().unwrap_or_else(|| DEFAULT_KDC_IMAGE.to_string());
+    let image = realm.spec.image.clone().unwrap_or_else(|| default_image.to_string());
     let port = |name: &str, port: i32, protocol: &str| ContainerPort {
         name: Some(name.into()),
         container_port: port,
@@ -318,7 +321,7 @@ pub async fn reconcile(realm: Arc<KerberosRealm>, ctx: Arc<Context>) -> Result<A
     Api::<ConfigMap>::namespaced(ctx.client.clone(), &ns).patch(&name, &pp, &Patch::Apply(&config_map(&realm))).await?;
     Api::<Service>::namespaced(ctx.client.clone(), &ns).patch(&name, &pp, &Patch::Apply(&service(&realm))).await?;
     Api::<StatefulSet>::namespaced(ctx.client.clone(), &ns)
-        .patch(&name, &pp, &Patch::Apply(&stateful_set(&realm)))
+        .patch(&name, &pp, &Patch::Apply(&stateful_set(&realm, &ctx.kdc_image)))
         .await?;
 
     let kdc = format!("{}:{}", kdc_host(&realm), KDC_PORT);
@@ -350,7 +353,7 @@ pub fn error_policy(realm: Arc<KerberosRealm>, e: &Error, _: Arc<Context>) -> Ac
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crd::KerberosRealmSpec;
+    use crate::crd::{DEFAULT_KDC_IMAGE, KerberosRealmSpec};
 
     fn realm() -> KerberosRealm {
         let mut r =
@@ -377,7 +380,7 @@ mod tests {
     #[test]
     fn the_kdc_runs_with_its_master_key_and_a_volume() {
         let r = realm();
-        let sts = stateful_set(&r);
+        let sts = stateful_set(&r, DEFAULT_KDC_IMAGE);
         let spec = sts.spec.as_ref().unwrap();
         assert_eq!(spec.replicas, Some(1));
         let c = &spec.template.spec.as_ref().unwrap().containers[0];

@@ -6,7 +6,8 @@
 #   1. builds krb5-operator:e2e (Dockerfile) and krb5-kdc:e2e (images/kdc)
 #      (BUILD=0: use images already built);
 #   2. creates a kind cluster and loads both images into it;
-#   3. installs the CRDs and the operator (deploy/), with the e2e image;
+#   3. installs the operator with its Helm chart (charts/krb5-operator),
+#      with the e2e images;
 #   4. runs chainsaw over tests/ (TESTS=tests/<name> for one test).
 #
 # Env: CLUSTER (krb5-operator-e2e)  BUILD (1)  KEEP (0; 1 = leave the
@@ -26,7 +27,7 @@ export KUBECONFIG="${KUBECONFIG_PRIVATE:-$(mktemp -d)/kubeconfig}"
 step() { printf '\n▶ %s\n' "$*" >&2; }
 fail() { printf '\n✗ %s\n' "$*" >&2; exit 1; }
 
-for t in docker kind kubectl chainsaw; do
+for t in docker kind kubectl helm chainsaw; do
   command -v "$t" >/dev/null || fail "$t not found in PATH"
 done
 
@@ -54,12 +55,14 @@ kind create cluster --name "$CLUSTER" --image "$KIND_NODE_IMAGE" --kubeconfig "$
 step "load images into the cluster"
 kind load docker-image --name "$CLUSTER" krb5-operator:e2e krb5-kdc:e2e
 
-step "install the operator"
-kubectl apply --server-side -f "$ROOT/deploy/crds.yaml"
+step "install the operator (Helm chart)"
+# The chart's CRDs, its RBAC and Deployment, with the e2e images: the KDC
+# image only as the default, so realms that name none get it.
+helm install krb5-operator "$ROOT/charts/krb5-operator" --namespace krb5-operator --create-namespace \
+  --set image.repository=krb5-operator --set image.tag=e2e --set image.pullPolicy=Never \
+  --set kdcImage.repository=krb5-kdc --set kdcImage.tag=e2e \
+  --wait --timeout 120s
 kubectl wait --for=condition=Established crd/kerberosrealms.krb5.ddalton.dev crd/kerberosprincipals.krb5.ddalton.dev
-perl -pe 's|image: ghcr.io/ddalton/krb5-operator:.*|image: krb5-operator:e2e\n          imagePullPolicy: Never|' \
-  "$ROOT/deploy/operator.yaml" | kubectl apply -f -
-kubectl -n krb5-operator rollout status deployment/krb5-operator --timeout=120s
 
 TESTS="${TESTS:-tests}"
 step "chainsaw: $TESTS"

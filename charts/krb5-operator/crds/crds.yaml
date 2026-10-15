@@ -1,0 +1,233 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: kerberosrealms.krb5.ddalton.dev
+spec:
+  group: krb5.ddalton.dev
+  names:
+    kind: KerberosRealm
+    plural: kerberosrealms
+    shortNames:
+    - krealm
+    singular: kerberosrealm
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.realm
+      name: Realm
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
+    - jsonPath: .status.kdc
+      name: KDC
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for KerberosRealmSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              image:
+                description: 'The KDC image (default: the operator''s MIT krb5 image).'
+                nullable: true
+                type: string
+              maxRenewableLife:
+                description: Maximum renewable lifetime (default `7d`).
+                nullable: true
+                type: string
+              maxTicketLife:
+                description: Maximum ticket lifetime (krb5 duration, default `10h`).
+                nullable: true
+                type: string
+              realm:
+                description: The realm name, by convention upper case (`EXAMPLE.COM`).
+                type: string
+              storage:
+                description: Size of the volume holding the KDC database (default `1Gi`).
+                nullable: true
+                type: string
+              storageClassName:
+                description: 'Storage class for that volume (default: the cluster''s).'
+                nullable: true
+                type: string
+            required:
+            - realm
+            type: object
+          status:
+            nullable: true
+            properties:
+              adminServer:
+                description: '`host:port` of kadmind.'
+                nullable: true
+                type: string
+              conditions:
+                default: []
+                items:
+                  description: A status condition (the Kubernetes convention).
+                  properties:
+                    lastTransitionTime:
+                      type: string
+                    message:
+                      type: string
+                    reason:
+                      type: string
+                    status:
+                      description: '`True`, `False` or `Unknown`.'
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              kdc:
+                description: '`host:port` of the KDC inside the cluster.'
+                nullable: true
+                type: string
+              krb5ConfConfigMap:
+                description: The ConfigMap with a client `krb5.conf` for this realm.
+                nullable: true
+                type: string
+              observedGeneration:
+                format: int64
+                nullable: true
+                type: integer
+            type: object
+        required:
+        - spec
+        title: KerberosRealm
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: kerberosprincipals.krb5.ddalton.dev
+spec:
+  group: krb5.ddalton.dev
+  names:
+    kind: KerberosPrincipal
+    plural: kerberosprincipals
+    shortNames:
+    - kprinc
+    singular: kerberosprincipal
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.realmRef
+      name: Realm
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
+    - jsonPath: .status.secretName
+      name: Secret
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for KerberosPrincipalSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              Principals with random keys, created through kadmind, and a Secret
+              holding their keytab.
+            properties:
+              deletionPolicy:
+                default: Delete
+                description: '`Delete` (default) or `Retain` the principals when this is deleted.'
+                enum:
+                - Delete
+                - Retain
+                type: string
+              keytabKey:
+                description: The key in that Secret (default `krb5.keytab`).
+                nullable: true
+                type: string
+              principals:
+                description: |-
+                  Principal names (`nn/host.example.com`): the realm is appended, or,
+                  if given (`...@REALM`), must be the realm's.
+                items:
+                  type: string
+                type: array
+              realmRef:
+                description: The `KerberosRealm` (same namespace) the principals belong to.
+                type: string
+              secretName:
+                description: 'The Secret to write the keytab to (default: this object''s name).'
+                nullable: true
+                type: string
+            required:
+            - principals
+            - realmRef
+            type: object
+          status:
+            nullable: true
+            properties:
+              conditions:
+                default: []
+                items:
+                  description: A status condition (the Kubernetes convention).
+                  properties:
+                    lastTransitionTime:
+                      type: string
+                    message:
+                      type: string
+                    reason:
+                      type: string
+                    status:
+                      description: '`True`, `False` or `Unknown`.'
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              observedGeneration:
+                format: int64
+                nullable: true
+                type: integer
+              principals:
+                default: []
+                description: Each principal (with its realm) and its key version.
+                items:
+                  properties:
+                    kvno:
+                      format: uint32
+                      minimum: 0.0
+                      type: integer
+                    name:
+                      type: string
+                  required:
+                  - kvno
+                  - name
+                  type: object
+                type: array
+              secretName:
+                description: The Secret holding the keytab.
+                nullable: true
+                type: string
+            type: object
+        required:
+        - spec
+        title: KerberosPrincipal
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

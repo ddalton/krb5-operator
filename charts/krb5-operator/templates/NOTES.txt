@@ -1,0 +1,19 @@
+krb5-operator {{ .Chart.AppVersion }} is running in {{ .Release.Namespace }}.
+
+Declare a realm (the operator runs its KDC in that namespace):
+
+  apiVersion: krb5.ddalton.dev/v1alpha1
+  kind: KerberosRealm
+  metadata: { name: corp }
+  spec: { realm: CORP.EXAMPLE.COM }
+
+then principals, whose keytab lands in a Secret:
+
+  apiVersion: krb5.ddalton.dev/v1alpha1
+  kind: KerberosPrincipal
+  metadata: { name: my-service }
+  spec: { realmRef: corp, principals: [HTTP/my-service.example.com] }
+
+Workloads mount the Secret and the realm's ConfigMap (<realm>-kdc, key
+krb5.conf). Helm installs the CRDs on first install only: on upgrade, apply
+crds/ from the chart first (kubectl apply --server-side -f).

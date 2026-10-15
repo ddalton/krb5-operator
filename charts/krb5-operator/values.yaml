@@ -1,0 +1,55 @@
+# The operator.
+image:
+  repository: ghcr.io/ddalton/krb5-operator
+  # Default: the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# The KDC image for KerberosRealms that do not set spec.image (point it at a
+# mirror for air-gapped clusters).
+kdcImage:
+  repository: ghcr.io/ddalton/krb5-kdc
+  # Default: the chart's appVersion.
+  tag: ""
+
+imagePullSecrets: []
+
+# RUST_LOG for the operator.
+logLevel: info,krb5=warn
+
+serviceAccount:
+  create: true
+  # Default: the release's full name.
+  name: ""
+  annotations: {}
+
+# The ClusterRole and its binding (the operator watches every namespace and
+# writes Secrets, ConfigMaps, Services and StatefulSets for its resources).
+rbac:
+  create: true
+
+podAnnotations: {}
+podLabels: {}
+priorityClassName: ""
+
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 32Mi
+  limits:
+    memory: 128Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
