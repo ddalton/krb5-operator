@@ -313,15 +313,18 @@ pub fn call(socket: &Path, method: &str, unit: &str) -> anyhow::Result<Outcome> 
         UnixStream::connect(socket).with_context(|| format!("connecting to systemd at {}", socket.display()))?;
     s.set_read_timeout(Some(Duration::from_secs(10)))?;
     s.set_write_timeout(Some(Duration::from_secs(10)))?;
-    s.write_all(format!("\0AUTH EXTERNAL {}\r\n", hex(&uid())).as_bytes())?;
+    // BEGIN goes with AUTH, as sd-bus's own client sends it, and the call
+    // only after systemd's OK. A call written together with BEGIN lands in
+    // systemd's (252) auth buffer, which it does not read again until some
+    // other event wakes the connection: measured on kind, the call ran 4 s
+    // late and its reply never came before our read timeout.
+    s.write_all(format!("\0AUTH EXTERNAL {}\r\nBEGIN\r\n", hex(&uid())).as_bytes())?;
     let ok = auth_line(&mut s)?;
     if !ok.starts_with("OK ") {
         bail!("systemd refused the connection: {ok:?} (the agent must be uid 0)");
     }
     let serial = 1;
-    let mut msg = b"BEGIN\r\n".to_vec();
-    msg.extend(encode(&unit_call(method, unit, serial)));
-    s.write_all(&msg)?;
+    s.write_all(&encode(&unit_call(method, unit, serial)))?;
     loop {
         let m = read_message(&mut s)?;
         if m.reply_serial() != Some(serial) || !matches!(m.kind, METHOD_RETURN | ERROR) {
