@@ -74,6 +74,10 @@ pub const OWNER_LABEL: &str = "krb5.ddalton.dev/node-keytab";
 pub const KEYTABS_DIR: &str = "/var/run/krb5-operator/keytabs";
 const HOST_KEYTAB_DIR: &str = "/host/keytab";
 const HOST_CONF_DIR: &str = "/host/krb5-conf";
+/// The host systemd's private socket, which `systemctl` uses as root, and
+/// where the agent's pod has it (only with `restartServices`).
+const HOST_SYSTEMD_SOCKET: &str = "/run/systemd/private";
+const SYSTEMD_SOCKET: &str = "/host/systemd/private";
 pub const STATE_DIR: &str = "/var/run/krb5-operator/state";
 /// The node a per-node Secret or DaemonSet is for (an annotation: node
 /// names may be longer than a label value).
@@ -172,7 +176,23 @@ pub fn validate(nk: &KerberosNodeKeytab) -> Result<(), Error> {
     if let Some(s) = nk.spec.services.iter().find(|s| s.is_empty() || s.contains(['/', '@'])) {
         return Err(Error::Invalid(format!("service {s:?}: a name, no '/' or '@'")));
     }
+    restart_units(nk)?;
     Ok(())
+}
+
+/// `restartServices` as systemd unit names (`rpc-gssd` →
+/// `rpc-gssd.service`), each once.
+pub fn restart_units(nk: &KerberosNodeKeytab) -> Result<Vec<String>, Error> {
+    let mut units: Vec<String> = Vec::new();
+    for s in &nk.spec.restart_services {
+        let u = crate::systemd::service_unit(s).ok_or_else(|| {
+            Error::Invalid(format!("restartServices {s:?}: a systemd service name (letters, digits, :_-@\\)"))
+        })?;
+        if !units.contains(&u) {
+            units.push(u);
+        }
+    }
+    Ok(units)
 }
 
 /// The principals for `nodes` (those selected), with the node each is for.
@@ -328,6 +348,20 @@ pub fn daemon_set(nk: &KerberosNodeKeytab, ns: &str, image: &str, node: &str) ->
         volumes.push(host_dir_volume("host-krb5-conf", &dir));
         mounts.push(mount("host-krb5-conf", HOST_CONF_DIR, false));
     }
+    // The host's systemd, only to (re)start the units asked for. A Socket
+    // hostPath: on a node without systemd the pod does not start (its
+    // events say why) rather than the runtime creating the path.
+    let units = restart_units(nk)?;
+    if !units.is_empty() {
+        args.extend(units.iter().map(|u| format!("--restart={u}")));
+        args.push(format!("--systemd={SYSTEMD_SOCKET}"));
+        volumes.push(Volume {
+            name: "host-systemd".into(),
+            host_path: Some(HostPathVolumeSource { path: HOST_SYSTEMD_SOCKET.into(), type_: Some("Socket".into()) }),
+            ..Default::default()
+        });
+        mounts.push(mount("host-systemd", SYSTEMD_SOCKET, true));
+    }
     let selector = node_labels(nk, node);
     let container = Container {
         name: "agent".into(),
@@ -357,8 +391,9 @@ pub fn daemon_set(nk: &KerberosNodeKeytab, ns: &str, image: &str, node: &str) ->
             limits: Some(BTreeMap::from([("memory".to_string(), Quantity("32Mi".into()))])),
             ..Default::default()
         }),
-        // Root, to write root's files in the host directories; no
-        // capabilities beyond (the files are root's own). spc_t: on
+        // Root, to write root's files in the host directories (and, with
+        // restartServices, for systemd's socket, which admits only uid 0);
+        // no capabilities beyond (the files are root's own). spc_t: on
         // SELinux hosts a container may not otherwise write /etc.
         security_context: Some(SecurityContext {
             run_as_user: Some(0),
@@ -924,6 +959,46 @@ mod tests {
         assert_eq!(sc.capabilities.as_ref().unwrap().drop.as_ref().unwrap(), &vec!["ALL".to_string()]);
         assert_eq!(sc.read_only_root_filesystem, Some(true));
         assert_eq!(pod.automount_service_account_token, Some(false), "the agent needs no API access");
+    }
+
+    #[test]
+    fn the_hosts_systemd_is_mounted_only_to_restart_services() {
+        // Not asked: no socket, no --restart.
+        let ds = daemon_set(&nk(spec()), "krb5-operator", "img:1", "w1").unwrap();
+        let pod = ds.spec.unwrap().template.spec.unwrap();
+        assert!(pod.volumes.unwrap().iter().all(|v| v.name != "host-systemd"));
+        assert!(pod.containers[0].args.as_ref().unwrap().iter().all(|a| !a.starts_with("--restart")));
+        assert_eq!(pod.host_pid, None, "never the host's PID namespace");
+
+        let mut s = spec();
+        s.restart_services = vec!["rpc-gssd".into(), "gssproxy.service".into(), "rpc-gssd.service".into()];
+        let k = nk(s);
+        assert_eq!(restart_units(&k).unwrap(), vec!["rpc-gssd.service", "gssproxy.service"], "each once");
+        let pod = daemon_set(&k, "krb5-operator", "img:1", "w1").unwrap().spec.unwrap().template.spec.unwrap();
+        let args = pod.containers[0].args.clone().unwrap();
+        assert!(args.ends_with(&[
+            "--restart=rpc-gssd.service".to_string(),
+            "--restart=gssproxy.service".into(),
+            format!("--systemd={SYSTEMD_SOCKET}"),
+        ]));
+        let vols = pod.volumes.unwrap();
+        let hp = vols.iter().find(|v| v.name == "host-systemd").unwrap().host_path.clone().unwrap();
+        assert_eq!((hp.path.as_str(), hp.type_.as_deref()), ("/run/systemd/private", Some("Socket")));
+        let m = pod.containers[0].volume_mounts.as_ref().unwrap().iter().find(|m| m.name == "host-systemd").unwrap();
+        assert_eq!((m.mount_path.as_str(), m.read_only), (SYSTEMD_SOCKET, Some(true)));
+        // No privilege beyond what the agent had: no capabilities, no
+        // host PID namespace, not privileged.
+        let sc = pod.containers[0].security_context.as_ref().unwrap();
+        assert_eq!(sc.capabilities.as_ref().unwrap().drop.as_ref().unwrap(), &vec!["ALL".to_string()]);
+        assert!(sc.capabilities.as_ref().unwrap().add.is_none());
+        assert_eq!(sc.privileged, None);
+        assert_eq!(pod.host_pid, None);
+
+        for bad in ["nfs-client.target", "a b", "rpc-gssd; reboot", ""] {
+            let mut s = spec();
+            s.restart_services = vec![bad.into()];
+            assert!(matches!(validate(&nk(s)), Err(Error::Invalid(_))), "{bad:?}");
+        }
     }
 
     #[test]
