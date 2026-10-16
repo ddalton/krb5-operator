@@ -17,9 +17,9 @@ metadata:
   labels:
     app.kubernetes.io/name: krb5-operator
     app.kubernetes.io/instance: krb5-operator
-    app.kubernetes.io/version: "0.3.0"
+    app.kubernetes.io/version: "0.4.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: krb5-operator-0.3.0
+    helm.sh/chart: krb5-operator-0.4.0
 ---
 # Source: krb5-operator/templates/rbac.yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -29,9 +29,9 @@ metadata:
   labels:
     app.kubernetes.io/name: krb5-operator
     app.kubernetes.io/instance: krb5-operator
-    app.kubernetes.io/version: "0.3.0"
+    app.kubernetes.io/version: "0.4.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: krb5-operator-0.3.0
+    helm.sh/chart: krb5-operator-0.4.0
 rules:
   - apiGroups: [krb5.ddalton.dev]
     resources: [kerberosrealms, kerberosprincipals, kerberosnodekeytabs]
@@ -69,9 +69,9 @@ metadata:
   labels:
     app.kubernetes.io/name: krb5-operator
     app.kubernetes.io/instance: krb5-operator
-    app.kubernetes.io/version: "0.3.0"
+    app.kubernetes.io/version: "0.4.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: krb5-operator-0.3.0
+    helm.sh/chart: krb5-operator-0.4.0
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
@@ -92,9 +92,9 @@ metadata:
   labels:
     app.kubernetes.io/name: krb5-operator
     app.kubernetes.io/instance: krb5-operator
-    app.kubernetes.io/version: "0.3.0"
+    app.kubernetes.io/version: "0.4.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: krb5-operator-0.3.0
+    helm.sh/chart: krb5-operator-0.4.0
 rules:
   - apiGroups: [""]
     resources: [secrets]
@@ -112,9 +112,9 @@ metadata:
   labels:
     app.kubernetes.io/name: krb5-operator
     app.kubernetes.io/instance: krb5-operator
-    app.kubernetes.io/version: "0.3.0"
+    app.kubernetes.io/version: "0.4.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: krb5-operator-0.3.0
+    helm.sh/chart: krb5-operator-0.4.0
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -133,9 +133,9 @@ metadata:
   labels:
     app.kubernetes.io/name: krb5-operator
     app.kubernetes.io/instance: krb5-operator
-    app.kubernetes.io/version: "0.3.0"
+    app.kubernetes.io/version: "0.4.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: krb5-operator-0.3.0
+    helm.sh/chart: krb5-operator-0.4.0
 spec:
   # One: the controllers are not leader-elected.
   replicas: 1
@@ -158,7 +158,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: operator
-          image: "ghcr.io/ddalton/krb5-operator:0.3.0"
+          image: "ghcr.io/ddalton/krb5-operator:0.4.0"
           imagePullPolicy: IfNotPresent
           env:
             - name: RUST_LOG
@@ -168,13 +168,13 @@ spec:
             # KerberosNodeKeytabs' DaemonSets run this image (node-agent)
             # in this namespace.
             - name: KRB5_OPERATOR_IMAGE
-              value: "ghcr.io/ddalton/krb5-operator:0.3.0"
+              value: "ghcr.io/ddalton/krb5-operator:0.4.0"
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
             - name: KRB5_KDC_IMAGE
-              value: "ghcr.io/ddalton/krb5-kdc:0.3.0"
+              value: "ghcr.io/ddalton/krb5-kdc:0.4.0"
           resources:
             limits:
               memory: 128Mi

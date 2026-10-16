@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 — 2026-10-16
 
 - **`KerberosNodeKeytab.spec.restartServices`** (e.g. `[rpc-gssd]`): the
   agent has the node's systemd start each unit when it starts, and restart

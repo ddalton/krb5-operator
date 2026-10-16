@@ -11,7 +11,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// The KDC image: MIT krb5kdc and kadmind (`images/kdc`).
-pub const DEFAULT_KDC_IMAGE: &str = "ghcr.io/ddalton/krb5-kdc:0.3.0";
+pub const DEFAULT_KDC_IMAGE: &str = "ghcr.io/ddalton/krb5-kdc:0.4.0";
 
 #[derive(CustomResource, Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
 #[kube(
