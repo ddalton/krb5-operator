@@ -156,10 +156,12 @@ spec:
           # The real node's kubelet, as the Node authorizer sees it: its
           # own Secret (its agent's pod mounts it), not the ghost's.
           as="--as=system:node:$node --as-group=system:nodes"
-          [ "$(kubectl -n $ns auth can-i get secret/$mine $as)" = yes ] || { echo "FAIL: the node cannot read its own keys"; exit 1; }
-          if [ "$(kubectl -n $ns auth can-i get secret/$ghost $as)" != no ]; then
+          # By exit status: a refusal prints "no - <the authorizer's reason>".
+          kubectl -n $ns auth can-i get secret/$mine $as --quiet || { echo "FAIL: the node cannot read its own keys"; exit 1; }
+          if kubectl -n $ns auth can-i get secret/$ghost $as --quiet; then
             echo "FAIL: node $node may read the ghost's keys"; exit 1
           fi
+          kubectl -n $ns auth can-i get secret/$ghost $as || true
           echo PASS
     - script:
         content: kubectl delete node krb5-e2e-ghost
