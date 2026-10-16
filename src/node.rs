@@ -4,20 +4,28 @@
 //! For each node it selects (labels, and taints the DaemonSet tolerates)
 //! the operator creates `<service>/<node hostname>` (`host/`, `nfs/` by
 //! default) as it creates any principal: random keys, marked with their
-//! owner (`KerberosNodeKeytab/<name>`), extracted, never changed. A Secret
-//! in the operator's namespace holds `<node>.keytab` for each node, and the
-//! realm's `krb5.conf` for hosts: the KDC by its Service's cluster IP, since
-//! a node's resolver does not know cluster DNS.
+//! owner (`KerberosNodeKeytab/<name>`), extracted, never changed.
 //!
-//! The DaemonSet (same namespace, same name as the Secret) runs
-//! `krb5-operator node-agent` on those nodes. It merges the node's keys
-//! into the host keytab ([`crate::agent`]): entries of other realms stay,
-//! entries of this realm are replaced. That is what the kernel's NFS client
-//! needs for `sec=krb5*`: rpc.gssd takes the node's machine credential
-//! from `/etc/krb5.keytab`.
+//! Each node gets its own Secret and its own DaemonSet in the operator's
+//! namespace (both [`node_object_name`]). The Secret holds `<node>.keytab`
+//! with that node's keys, and the realm's `krb5.conf` for hosts: the KDC by
+//! its Service's cluster IP, since a node's resolver does not know cluster
+//! DNS. The DaemonSet, pinned to the node (`matchFields metadata.name`),
+//! mounts that Secret alone and runs `krb5-operator node-agent`. It merges
+//! the node's keys into the host keytab ([`crate::agent`]): entries of
+//! other realms stay, entries of this realm are replaced. That is what the
+//! kernel's NFS client needs for `sec=krb5*`: rpc.gssd takes the node's
+//! machine credential from `/etc/krb5.keytab`.
 //!
-//! Every DaemonSet pod mounts the whole Secret, so a node can read the
-//! other selected nodes' keys; select only the nodes that need them.
+//! One Secret per node is what keeps a node's keys from the others. The
+//! Node authorizer lets a kubelet read only the Secrets of pods bound to
+//! its node, so root on a node (holding its kubelet's credentials) gets
+//! that node's keys and no other node's. A node's keys are what it proves
+//! it is with: an NFS server that serves only the nodes a volume is
+//! attached to, or binds sessions to the machine that made them, trusts
+//! them. (Before 0.4 one Secret held every node's keys, mounted on every
+//! node; its objects, named [`KerberosNodeKeytab::object_name`], are
+//! deleted.)
 //!
 //! Nodes that go, or stop being selected, have their principals deleted
 //! (`Retain` keeps them); so does the object's deletion, with the Secret
@@ -34,9 +42,10 @@ use std::time::Duration;
 use k8s_openapi::ByteString;
 use k8s_openapi::api::apps::v1::{DaemonSet, DaemonSetSpec};
 use k8s_openapi::api::core::v1::{
-    Capabilities, Container, EmptyDirVolumeSource, EnvVar, EnvVarSource, ExecAction, HostPathVolumeSource, Node,
-    ObjectFieldSelector, PodSpec, PodTemplateSpec, Probe, ResourceRequirements, SELinuxOptions, SeccompProfile, Secret,
-    SecretVolumeSource, SecurityContext, Service, Taint, Toleration, Volume, VolumeMount,
+    Affinity, Capabilities, Container, EmptyDirVolumeSource, EnvVar, EnvVarSource, ExecAction, HostPathVolumeSource,
+    Node, NodeAffinity, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm, ObjectFieldSelector, PodSpec,
+    PodTemplateSpec, Probe, ResourceRequirements, SELinuxOptions, SeccompProfile, Secret, SecretVolumeSource,
+    SecurityContext, Service, Taint, Toleration, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
@@ -66,6 +75,12 @@ pub const KEYTABS_DIR: &str = "/var/run/krb5-operator/keytabs";
 const HOST_KEYTAB_DIR: &str = "/host/keytab";
 const HOST_CONF_DIR: &str = "/host/krb5-conf";
 pub const STATE_DIR: &str = "/var/run/krb5-operator/state";
+/// The node a per-node Secret or DaemonSet is for (an annotation: node
+/// names may be longer than a label value).
+pub const NODE_ANNOTATION: &str = "krb5.ddalton.dev/node";
+/// Tells one node's DaemonSet pods from another's: DaemonSets must not
+/// select each other's pods.
+const NODE_LABEL: &str = "krb5.ddalton.dev/node-keytab-node";
 
 pub struct Context {
     pub client: Client,
@@ -198,17 +213,36 @@ pub fn host_krb5_conf(realm: &str, cluster_ip: &str, cluster_domain: &str, domai
     s
 }
 
-/// The Secret's files: `<node>.keytab` with each node's keys, and the
-/// hosts' `krb5.conf`.
-pub fn secret_files(wanted: &[(Principal, String)], keys: &[PrincipalKeys], conf: &str) -> BTreeMap<String, Vec<u8>> {
-    let mut nodes: BTreeMap<&str, Vec<PrincipalKeys>> = BTreeMap::new();
+/// Each node's keys, by node name.
+pub fn keys_by_node(wanted: &[(Principal, String)], keys: &[PrincipalKeys]) -> BTreeMap<String, Vec<PrincipalKeys>> {
+    let mut nodes: BTreeMap<String, Vec<PrincipalKeys>> = BTreeMap::new();
     for ((_, node), k) in wanted.iter().zip(keys) {
-        nodes.entry(node).or_default().push(k.clone());
+        nodes.entry(node.clone()).or_default().push(k.clone());
     }
-    let mut files: BTreeMap<String, Vec<u8>> =
-        nodes.into_iter().map(|(n, ks)| (format!("{n}.keytab"), keytab(&ks).to_bytes())).collect();
-    files.insert(KRB5_CONF_KEY.into(), conf.as_bytes().to_vec());
-    files
+    nodes
+}
+
+/// A node's Secret's files: `<node>.keytab` with its keys, and the hosts'
+/// `krb5.conf`.
+pub fn node_files(node: &str, keys: &[PrincipalKeys], conf: &str) -> BTreeMap<String, Vec<u8>> {
+    BTreeMap::from([
+        (format!("{node}.keytab"), keytab(keys).to_bytes()),
+        (KRB5_CONF_KEY.to_string(), conf.as_bytes().to_vec()),
+    ])
+}
+
+/// A short, stable digest of `nk`'s name and a node's: names that fit
+/// where node names (up to 253 characters) would not.
+fn node_digest(nk: &KerberosNodeKeytab, node: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let h = Sha256::digest(format!("{}/{node}", nk.name_any()).as_bytes());
+    h[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The name of a node's Secret and DaemonSet: `node-keytab-<digest>`, 28
+/// characters, so its pods' names fit.
+pub fn node_object_name(nk: &KerberosNodeKeytab, node: &str) -> String {
+    format!("node-keytab-{}", node_digest(nk, node))
 }
 
 fn labels(nk: &KerberosNodeKeytab) -> BTreeMap<String, String> {
@@ -219,19 +253,28 @@ fn labels(nk: &KerberosNodeKeytab) -> BTreeMap<String, String> {
     ])
 }
 
-fn meta(nk: &KerberosNodeKeytab, ns: &str) -> ObjectMeta {
+fn node_labels(nk: &KerberosNodeKeytab, node: &str) -> BTreeMap<String, String> {
+    let mut l = labels(nk);
+    l.insert(NODE_LABEL.to_string(), node_digest(nk, node));
+    l
+}
+
+fn meta(nk: &KerberosNodeKeytab, ns: &str, node: &str) -> ObjectMeta {
     ObjectMeta {
-        name: Some(nk.object_name()),
+        name: Some(node_object_name(nk, node)),
         namespace: Some(ns.to_string()),
-        labels: Some(labels(nk)),
+        labels: Some(node_labels(nk, node)),
+        annotations: Some(BTreeMap::from([(NODE_ANNOTATION.to_string(), node.to_string())])),
         owner_references: Some(vec![nk.controller_owner_ref(&()).expect("a stored KerberosNodeKeytab has a uid")]),
         ..Default::default()
     }
 }
 
-pub fn secret(nk: &KerberosNodeKeytab, ns: &str, files: BTreeMap<String, Vec<u8>>, fp: &str) -> Secret {
-    let mut metadata = meta(nk, ns);
-    metadata.annotations = Some(BTreeMap::from([(KEYS_SHA256.to_string(), fp.to_string())]));
+/// A node's Secret: its keys and the hosts' `krb5.conf` (`files`, from
+/// [`node_files`]), with the keys' fingerprint.
+pub fn secret(nk: &KerberosNodeKeytab, ns: &str, node: &str, files: BTreeMap<String, Vec<u8>>, fp: &str) -> Secret {
+    let mut metadata = meta(nk, ns, node);
+    metadata.annotations.get_or_insert_default().insert(KEYS_SHA256.to_string(), fp.to_string());
     Secret {
         metadata,
         type_: Some("Opaque".into()),
@@ -252,8 +295,9 @@ fn mount(name: &str, path: &str, read_only: bool) -> VolumeMount {
     VolumeMount { name: name.into(), mount_path: path.into(), read_only: Some(read_only), ..Default::default() }
 }
 
-/// The DaemonSet that installs the keys on each selected node.
-pub fn daemon_set(nk: &KerberosNodeKeytab, ns: &str, image: &str) -> Result<DaemonSet, Error> {
+/// The DaemonSet that installs `node`'s keys on it: pinned to the node,
+/// mounting the node's Secret alone.
+pub fn daemon_set(nk: &KerberosNodeKeytab, ns: &str, image: &str, node: &str) -> Result<DaemonSet, Error> {
     let (kt_dir, kt_file) = host_path("keytabPath", &nk.keytab_path())?;
     let mut args = vec![
         "node-agent".to_string(),
@@ -264,7 +308,7 @@ pub fn daemon_set(nk: &KerberosNodeKeytab, ns: &str, image: &str) -> Result<Daem
         Volume {
             name: "keytabs".into(),
             secret: Some(SecretVolumeSource {
-                secret_name: Some(nk.object_name()),
+                secret_name: Some(node_object_name(nk, node)),
                 default_mode: Some(0o400),
                 ..Default::default()
             }),
@@ -284,7 +328,7 @@ pub fn daemon_set(nk: &KerberosNodeKeytab, ns: &str, image: &str) -> Result<Daem
         volumes.push(host_dir_volume("host-krb5-conf", &dir));
         mounts.push(mount("host-krb5-conf", HOST_CONF_DIR, false));
     }
-    let selector = labels(nk);
+    let selector = node_labels(nk, node);
     let container = Container {
         name: "agent".into(),
         image: Some(image.into()),
@@ -328,8 +372,25 @@ pub fn daemon_set(nk: &KerberosNodeKeytab, ns: &str, image: &str) -> Result<Daem
         }),
         ..Default::default()
     };
+    // How the DaemonSet controller itself pins a pod to a node.
+    let pin = Affinity {
+        node_affinity: Some(NodeAffinity {
+            required_during_scheduling_ignored_during_execution: Some(NodeSelector {
+                node_selector_terms: vec![NodeSelectorTerm {
+                    match_fields: Some(vec![NodeSelectorRequirement {
+                        key: "metadata.name".into(),
+                        operator: "In".into(),
+                        values: Some(vec![node.to_string()]),
+                    }]),
+                    ..Default::default()
+                }],
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
     Ok(DaemonSet {
-        metadata: meta(nk, ns),
+        metadata: meta(nk, ns, node),
         spec: Some(DaemonSetSpec {
             selector: LabelSelector { match_labels: Some(selector.clone()), ..Default::default() },
             template: PodTemplateSpec {
@@ -337,7 +398,7 @@ pub fn daemon_set(nk: &KerberosNodeKeytab, ns: &str, image: &str) -> Result<Daem
                 spec: Some(PodSpec {
                     containers: vec![container],
                     volumes: Some(volumes),
-                    node_selector: nk.spec.node_selector.clone(),
+                    affinity: Some(pin),
                     tolerations: nk.spec.tolerations.clone(),
                     termination_grace_period_seconds: Some(5),
                     automount_service_account_token: Some(false),
@@ -360,6 +421,17 @@ pub fn rollout(ds: &DaemonSet) -> Option<(i32, i32)> {
     let desired = st.desired_number_scheduled;
     let updated = st.updated_number_scheduled.unwrap_or(0);
     Some((st.number_ready.min(updated), desired))
+}
+
+/// All the nodes' DaemonSets together: `(installed, nodes)`, or `None`
+/// while any has not looked at its current spec.
+pub fn total_rollout(each: &[Option<(i32, i32)>]) -> Option<(i32, i32)> {
+    each.iter().try_fold((0, 0), |(d, a), r| r.map(|(rd, ra)| (d + rd, a + ra)))
+}
+
+/// The names in `existing` that are not in `keep`.
+pub fn stale(keep: &[String], existing: impl Iterator<Item = String>) -> Vec<String> {
+    existing.filter(|n| !keep.contains(n)).collect()
 }
 
 async fn set_status(client: &Client, nk: &KerberosNodeKeytab, status: KerberosNodeKeytabStatus) -> Result<(), Error> {
@@ -410,7 +482,6 @@ async fn sync(nk: &KerberosNodeKeytab, ctx: &Context) -> Result<Action, Error> {
         let (admin, ps, owner) = (admin.clone(), ps.clone(), nk.owner());
         blocking(move || admin.ensure(&ps, &owner)).await??
     };
-    let fp = fingerprint(&keys);
 
     let svc = Api::<Service>::namespaced(client.clone(), &nk.spec.realm_namespace)
         .get_opt(&realm.base_name())
@@ -420,22 +491,49 @@ async fn sync(nk: &KerberosNodeKeytab, ctx: &Context) -> Result<Action, Error> {
         .ok_or_else(|| Error::RealmNotReady(realm.name_any(), "its Service has no cluster IP".into()))?;
     let conf = host_krb5_conf(&admin.realm, &svc, &ctx.cluster_domain, nk.spec.domain.as_deref());
 
+    // Each node: its Secret (rewritten when its keys or the conf
+    // changed), and its DaemonSet.
     let ns = &ctx.namespace;
-    let name = nk.object_name();
     let secrets: Api<Secret> = Api::namespaced(client.clone(), ns);
-    let current = secrets.get_opt(&name).await?;
-    let unchanged = current.as_ref().is_some_and(|s| {
-        s.annotations().get(KEYS_SHA256) == Some(&fp)
-            && s.data.as_ref().is_some_and(|d| d.get(KRB5_CONF_KEY).is_some_and(|b| b.0 == conf.as_bytes()))
-    });
-    if !unchanged {
-        let s = secret(nk, ns, secret_files(&wanted, &keys, &conf), &fp);
-        secrets.patch(&name, &PatchParams::apply(MANAGER).force(), &Patch::Apply(&s)).await?;
-        info!("Wrote the keys of {} for {} principals to Secret {ns}/{name}", nk.name_any(), keys.len());
+    let daemon_sets: Api<DaemonSet> = Api::namespaced(client.clone(), ns);
+    let mut unchanged = true;
+    let mut rollouts = Vec::new();
+    let by_node = keys_by_node(&wanted, &keys);
+    for (node, node_keys) in &by_node {
+        let name = node_object_name(nk, node);
+        let node_fp = fingerprint(node_keys);
+        let current = secrets.get_opt(&name).await?;
+        let same = current.as_ref().is_some_and(|s| {
+            s.annotations().get(KEYS_SHA256) == Some(&node_fp)
+                && s.data.as_ref().is_some_and(|d| d.get(KRB5_CONF_KEY).is_some_and(|b| b.0 == conf.as_bytes()))
+        });
+        if !same {
+            unchanged = false;
+            let s = secret(nk, ns, node, node_files(node, node_keys, &conf), &node_fp);
+            secrets.patch(&name, &PatchParams::apply(MANAGER).force(), &Patch::Apply(&s)).await?;
+            info!("Wrote node {node}'s keys ({} principals) to Secret {ns}/{name}", node_keys.len());
+        }
+        let ds = daemon_sets
+            .patch(
+                &name,
+                &PatchParams::apply(MANAGER).force(),
+                &Patch::Apply(&daemon_set(nk, ns, &ctx.agent_image, node)?),
+            )
+            .await?;
+        rollouts.push(rollout(&ds));
     }
-    let ds = Api::<DaemonSet>::namespaced(client.clone(), ns)
-        .patch(&name, &PatchParams::apply(MANAGER).force(), &Patch::Apply(&daemon_set(nk, ns, &ctx.agent_image)?))
-        .await?;
+    // What no wanted node has any more: a node gone or no longer
+    // selected, and the one shared Secret and DaemonSet of before 0.4.
+    let keep: Vec<String> = by_node.keys().map(|n| node_object_name(nk, n)).collect();
+    let mine = ListParams::default().labels(&format!("{OWNER_LABEL}={}", nk.name_any()));
+    for o in stale(&keep, daemon_sets.list(&mine).await?.items.iter().map(|d| d.name_any())) {
+        daemon_sets.delete(&o, &Default::default()).await?;
+        info!("Deleted DaemonSet {ns}/{o}, which no node of {} needs", nk.name_any());
+    }
+    for o in stale(&keep, secrets.list(&mine).await?.items.iter().map(|s| s.name_any())) {
+        secrets.delete(&o, &Default::default()).await?;
+        info!("Deleted Secret {ns}/{o}, which no node of {} needs", nk.name_any());
+    }
 
     // Nodes gone or no longer selected: their principals go.
     let had = nk.status.as_ref().map(|s| s.principals.as_slice()).unwrap_or_default();
@@ -465,7 +563,7 @@ async fn sync(nk: &KerberosNodeKeytab, ctx: &Context) -> Result<Action, Error> {
         n.dedup();
         n.len() as u32
     };
-    let cond: Condition = match (rejected, rollout(&ds)) {
+    let cond: Condition = match (rejected, total_rollout(&rollouts)) {
         (Some(e), _) => {
             warn!("{}: {}", nk.name_any(), e);
             condition(false, "KeytabRejected", &e)
@@ -474,7 +572,7 @@ async fn sync(nk: &KerberosNodeKeytab, ctx: &Context) -> Result<Action, Error> {
             condition(true, "Installed", &format!("the keys are installed on {all} nodes"))
         }
         (None, Some((done, all))) => condition(false, "Installing", &format!("installed on {done} of {all} nodes")),
-        (None, None) => condition(false, "Installing", "the DaemonSet is starting"),
+        (None, None) => condition(false, "Installing", "the DaemonSets are starting"),
     };
     // Keep the transition time while the condition holds.
     let cond = match nk.status.as_ref().and_then(|s| s.conditions.iter().find(|c| c.type_ == "Ready")) {
@@ -734,11 +832,48 @@ mod tests {
             .collect();
         let keys: Vec<PrincipalKeys> =
             w.iter().enumerate().map(|(i, (p, _))| (p.clone(), vec![(1, k(i as u8))])).collect();
-        let files = secret_files(&w, &keys, "conf");
-        assert_eq!(files.keys().collect::<Vec<_>>(), vec!["krb5.conf", "w1.keytab", "w2.keytab"]);
-        let has = |f: &str, b: u8| files[f].windows(32).any(|w| w == [b; 32]);
-        assert!(has("w1.keytab", 0) && has("w1.keytab", 1) && !has("w1.keytab", 2));
-        assert!(has("w2.keytab", 2) && !has("w2.keytab", 0));
+        let by_node = keys_by_node(&w, &keys);
+        assert_eq!(by_node.keys().collect::<Vec<_>>(), vec!["w1", "w2"]);
+        let w1 = node_files("w1", &by_node["w1"], "conf");
+        let w2 = node_files("w2", &by_node["w2"], "conf");
+        assert_eq!(w1.keys().collect::<Vec<_>>(), vec!["krb5.conf", "w1.keytab"], "w1's Secret: no w2.keytab");
+        assert_eq!(w2.keys().collect::<Vec<_>>(), vec!["krb5.conf", "w2.keytab"]);
+        let has = |f: &BTreeMap<String, Vec<u8>>, b: u8| f.values().any(|v| v.windows(32).any(|w| w == [b; 32]));
+        assert!(has(&w1, 0) && has(&w1, 1) && !has(&w1, 2), "w1's keys, and only w1's");
+        assert!(has(&w2, 2) && !has(&w2, 0) && !has(&w2, 1));
+        let sec = secret(&nk(spec()), "krb5-operator", "w1", w1, "fp");
+        assert_eq!(sec.metadata.name.unwrap(), node_object_name(&nk(spec()), "w1"));
+        let ann = sec.metadata.annotations.unwrap();
+        assert_eq!((ann[NODE_ANNOTATION].as_str(), ann[KEYS_SHA256].as_str()), ("w1", "fp"));
+    }
+
+    #[test]
+    fn each_node_has_its_own_short_stable_object_names() {
+        let k = nk(spec());
+        let a = node_object_name(&k, "w1");
+        assert_eq!(a, node_object_name(&k, "w1"), "stable");
+        assert_ne!(a, node_object_name(&k, "w2"));
+        let other = KerberosNodeKeytab::new("other", spec());
+        assert_ne!(a, node_object_name(&other, "w1"), "per KerberosNodeKeytab too");
+        let long = "n".repeat(253);
+        assert_eq!(node_object_name(&k, &long).len(), 28, "a 253-character node name still fits");
+        assert!(a.starts_with("node-keytab-"));
+        assert_ne!(a, k.object_name(), "not the pre-0.4 shared name, which is pruned");
+    }
+
+    #[test]
+    fn what_no_node_needs_is_stale() {
+        let keep = vec!["node-keytab-aa".to_string(), "node-keytab-bb".to_string()];
+        let existing = ["node-keytab-aa", "node-keytab-nfs-clients", "node-keytab-cc"].map(String::from);
+        assert_eq!(stale(&keep, existing.into_iter()), vec!["node-keytab-nfs-clients", "node-keytab-cc"]);
+        assert!(stale(&[], std::iter::empty()).is_empty());
+    }
+
+    #[test]
+    fn the_rollout_adds_up_the_nodes() {
+        assert_eq!(total_rollout(&[Some((1, 1)), Some((0, 1))]), Some((1, 2)));
+        assert_eq!(total_rollout(&[Some((1, 1)), None]), None, "one not yet looked at");
+        assert_eq!(total_rollout(&[]), Some((0, 0)), "no nodes: nothing to install");
     }
 
     #[test]
@@ -747,11 +882,27 @@ mod tests {
         s.node_selector = Some(BTreeMap::from([("nfs".to_string(), "krb5".to_string())]));
         s.krb5_conf_path = Some("/etc/krb5.conf.d/corp.conf".into());
         let k = nk(s);
-        let ds = daemon_set(&k, "krb5-operator", "img:1").unwrap();
-        assert_eq!(ds.metadata.name.as_deref(), Some("node-keytab-nfs-clients"));
+        let ds = daemon_set(&k, "krb5-operator", "img:1", "w1").unwrap();
+        let name = node_object_name(&k, "w1");
+        assert_eq!(ds.metadata.name.as_deref(), Some(name.as_str()));
         assert_eq!(ds.metadata.owner_references.as_ref().unwrap()[0].uid, "u-1");
-        let pod = ds.spec.unwrap().template.spec.unwrap();
-        assert_eq!(pod.node_selector.unwrap()["nfs"], "krb5");
+        let spec = ds.spec.unwrap();
+        // Two nodes' DaemonSets select disjoint pods.
+        let other = daemon_set(&k, "krb5-operator", "img:1", "w2").unwrap().spec.unwrap();
+        assert_ne!(spec.selector.match_labels, other.selector.match_labels);
+        let pod = spec.template.spec.unwrap();
+        // Pinned to its node, as the DaemonSet controller pins.
+        let term = &pod
+            .affinity
+            .unwrap()
+            .node_affinity
+            .unwrap()
+            .required_during_scheduling_ignored_during_execution
+            .unwrap()
+            .node_selector_terms[0];
+        let f = &term.match_fields.as_ref().unwrap()[0];
+        assert_eq!((f.key.as_str(), f.operator.as_str()), ("metadata.name", "In"));
+        assert_eq!(f.values.as_deref(), Some(&["w1".to_string()][..]));
         let c = &pod.containers[0];
         assert_eq!(c.image.as_deref(), Some("img:1"));
         assert_eq!(
@@ -768,7 +919,7 @@ mod tests {
         assert_eq!(host("host-keytab"), "/etc");
         assert_eq!(host("host-krb5-conf"), "/etc/krb5.conf.d");
         let secret = vols.iter().find(|v| v.name == "keytabs").unwrap().secret.as_ref().unwrap();
-        assert_eq!(secret.secret_name.as_deref(), Some("node-keytab-nfs-clients"));
+        assert_eq!(secret.secret_name.as_deref(), Some(name.as_str()), "its node's Secret alone");
         let sc = c.security_context.as_ref().unwrap();
         assert_eq!(sc.capabilities.as_ref().unwrap().drop.as_ref().unwrap(), &vec!["ALL".to_string()]);
         assert_eq!(sc.read_only_root_filesystem, Some(true));

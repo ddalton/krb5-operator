@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **`KerberosNodeKeytab`: each node reads only its own keys.** Every node
+  now gets its own Secret and its own DaemonSet, pinned to it, which
+  mounts only that Secret. Before, one Secret held every node's keys and
+  every node's agent mounted it, so root on any node (with its kubelet's
+  credentials) could read every node's keys and pass for any of them. The
+  Node authorizer now limits each kubelet to its own node's keys. On
+  upgrade the shared Secret and DaemonSet of 0.3 are deleted. RBAC: a Role
+  in the operator's namespace may delete Secrets and DaemonSets there,
+  for nodes that go.
 - krb5 1.0.0. Keytab entries are built with `ServiceKey::new` (its fields
   are `#[non_exhaustive]` now); nothing else changes.
 - krb5 0.12.1 (its AP-REQ parsing panic fix). Keytab logins (verifying a keytab) use SPAKE when the KDC
