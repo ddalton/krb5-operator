@@ -9,7 +9,10 @@ spec:
     and its DaemonSet merges their keys into the node's keytab, keeping
     another realm's entry there, with a krb5.conf that reaches the KDC by
     cluster IP: from the host network with the host's resolver, kinit works
-    with each key. Unlabelled, the node's principals are deleted.
+    with each key. Each node's keys are in its own Secret, which only that
+    node's kubelet may read (the Node authorizer): a second, ghost node
+    gets its own, which the real node cannot read. Unlabelled, the node's
+    principals are deleted.
   steps:
   - name: realm-and-seed
     try:
@@ -101,10 +104,86 @@ spec:
     - script:
         content: |
           set -eu
-          s=$(kubectl -n krb5-operator get secret node-keytab-e2e-nodes -o jsonpath='{.data}')
           node=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
+          sel=krb5.ddalton.dev/node-keytab=e2e-nodes
+          [ "$(kubectl -n krb5-operator get secrets -l $sel -o name | wc -l)" = 1 ]
+          [ "$(kubectl -n krb5-operator get daemonsets -l $sel -o name | wc -l)" = 1 ]
+          s=$(kubectl -n krb5-operator get secrets -l $sel -o jsonpath='{.items[0].data}')
           echo "$s" | grep -q "\"$node.keytab\""
           echo "$s" | grep -q '"krb5.conf"'
+  - name: one-node-cannot-read-anothers-keys
+    try:
+    # A second node, with no kubelet: it gets principals and a Secret of
+    # its own like any selected node.
+    - script:
+        content: |
+          set -eu
+          cat <<YAML | kubectl apply -f -
+          apiVersion: v1
+          kind: Node
+          metadata:
+            name: krb5-e2e-ghost
+            labels:
+              krb5-e2e: "yes"
+          YAML
+    - assert:
+        resource:
+          apiVersion: krb5.ddalton.dev/v1alpha1
+          kind: KerberosNodeKeytab
+          metadata:
+            name: e2e-nodes
+          status:
+            nodes: 2
+    - script:
+        content: |
+          set -eu
+          node=$(kubectl get nodes -o jsonpath='{.items[?(@.metadata.name!="krb5-e2e-ghost")].metadata.name}')
+          ns=krb5-operator
+          sel=krb5.ddalton.dev/node-keytab=e2e-nodes
+          secret_of() {
+            kubectl -n $ns get secrets -l $sel -o json |
+              jq -r --arg n "$1" '.items[] | select(.metadata.annotations["krb5.ddalton.dev/node"] == $n) | .metadata.name'
+          }
+          mine=$(secret_of "$node"); ghost=$(secret_of krb5-e2e-ghost)
+          echo "node $node: $mine; ghost: $ghost"
+          [ -n "$mine" ] && [ -n "$ghost" ] && [ "$mine" != "$ghost" ]
+          # Each holds its own node's keys only.
+          keys() { kubectl -n $ns get secret "$1" -o json | jq -r '.data | keys[]' | sort | tr '\n' ' '; }
+          [ "$(keys "$mine")" = "$node.keytab krb5.conf " ] || { echo "FAIL: $mine has $(keys "$mine")"; exit 1; }
+          [ "$(keys "$ghost")" = "krb5-e2e-ghost.keytab krb5.conf " ] || { echo "FAIL: $ghost has $(keys "$ghost")"; exit 1; }
+          # The real node's kubelet, as the Node authorizer sees it: its
+          # own Secret (its agent's pod mounts it), not the ghost's.
+          as="--as=system:node:$node --as-group=system:nodes"
+          [ "$(kubectl -n $ns auth can-i get secret/$mine $as)" = yes ] || { echo "FAIL: the node cannot read its own keys"; exit 1; }
+          if [ "$(kubectl -n $ns auth can-i get secret/$ghost $as)" != no ]; then
+            echo "FAIL: node $node may read the ghost's keys"; exit 1
+          fi
+          echo PASS
+    - script:
+        content: kubectl delete node krb5-e2e-ghost
+    - assert:
+        resource:
+          apiVersion: krb5.ddalton.dev/v1alpha1
+          kind: KerberosNodeKeytab
+          metadata:
+            name: e2e-nodes
+          status:
+            nodes: 1
+            (conditions[?type == 'Ready']):
+            - status: "True"
+    # The ghost's Secret and DaemonSet go with it.
+    - script:
+        content: |
+          set -eu
+          sel=krb5.ddalton.dev/node-keytab=e2e-nodes
+          for i in $(seq 30); do
+            [ "$(kubectl -n krb5-operator get secrets,daemonsets -l $sel -o name | wc -l)" = 2 ] && { echo PASS; exit 0; }
+            sleep 2
+          done
+          kubectl -n krb5-operator get secrets,daemonsets -l $sel; exit 1
+    finally:
+    - script:
+        content: kubectl delete node krb5-e2e-ghost --ignore-not-found
   - name: unlabel
     try:
     - script:
