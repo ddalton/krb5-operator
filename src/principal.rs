@@ -287,13 +287,7 @@ pub fn keytab(keys: &[PrincipalKeys]) -> Keytab {
     for (p, ks) in keys {
         for (kvno, k) in ks {
             if let Some(enctype) = EncType::from_i32(k.enctype()) {
-                entries.push(ServiceKey {
-                    principal: p.name(),
-                    realm: p.realm.clone(),
-                    kvno: *kvno,
-                    enctype,
-                    key: k.bytes().to_vec(),
-                });
+                entries.push(ServiceKey::new(p.name(), p.realm.clone(), *kvno, enctype, k.bytes().to_vec()));
             }
         }
     }

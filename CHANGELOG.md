@@ -21,6 +21,8 @@
   upgrade the shared Secret and DaemonSet of 0.3 are deleted. RBAC: a Role
   in the operator's namespace may delete Secrets and DaemonSets there,
   for nodes that go.
+- krb5 1.0.0. Keytab entries are built with `ServiceKey::new` (its fields
+  are `#[non_exhaustive]` now); nothing else changes.
 - krb5 0.12.1 (its AP-REQ parsing panic fix). Keytab logins (verifying a keytab) use SPAKE when the KDC
   offers it.
 
