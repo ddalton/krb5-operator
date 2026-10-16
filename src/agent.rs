@@ -11,6 +11,15 @@
 //! to a temporary file in the same directory, synced, then renamed over the
 //! old one, so rpc.gssd never reads half a keytab. A host keytab that is
 //! not a keytab is left alone (and the agent is not ready).
+//!
+//! With `--restart=<unit>` (the spec's `restartServices`) the agent also
+//! has the host's systemd start each unit when it starts, and restart it
+//! whenever it writes a file ([`crate::systemd`]). That is for `rpc-gssd`:
+//! nfs-utils' unit has `ConditionPathExists=/etc/krb5.keytab`, so on a node
+//! that booted before its keys arrived it never ran, and a `try-restart`
+//! would leave it so. A unit the host does not have, or has masked, is
+//! skipped (logged once); a call that fails is tried again on the next
+//! pass, and the agent is not ready until it works.
 
 use std::collections::BTreeSet;
 use std::io::Write;
@@ -106,6 +115,55 @@ pub struct Options {
     pub node: String,
     pub keytab: PathBuf,
     pub krb5_conf: Option<PathBuf>,
+    /// systemd units to start, and restart when a file changes.
+    pub restart: Vec<String>,
+    /// The host systemd's private socket, as the pod mounts it.
+    pub systemd: PathBuf,
+}
+
+/// What the agent owes the units of `--restart`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Kick {
+    /// Start them if they are not running (the agent just started: they
+    /// may never have run, or a node rebooted before its keys came).
+    Start,
+    /// Restart them: a file they read changed.
+    Restart,
+}
+
+impl Kick {
+    fn method(self) -> &'static str {
+        match self {
+            Kick::Start => "StartUnit",
+            Kick::Restart => "RestartUnit",
+        }
+    }
+}
+
+/// What is owed after a pass that changed `changed`, given what was owed:
+/// a restart outranks a start, and nothing is owed without units.
+pub fn owed(before: Option<Kick>, changed: &[String], units: &[String]) -> Option<Kick> {
+    if units.is_empty() {
+        None
+    } else if !changed.is_empty() {
+        Some(Kick::Restart)
+    } else {
+        before
+    }
+}
+
+/// Starts or restarts each unit through `socket`. Units the host lacks are
+/// returned, to log; any other failure is an error, and the whole kick is
+/// owed again (a second restart of a unit is harmless).
+pub fn kick(socket: &Path, units: &[String], k: Kick) -> anyhow::Result<Vec<String>> {
+    let mut absent = Vec::new();
+    for u in units {
+        match crate::systemd::call(socket, k.method(), u)? {
+            crate::systemd::Outcome::Queued => info!("Asked systemd to {} {u}", k.method()),
+            crate::systemd::Outcome::Absent(why) => absent.push(format!("{u}: {why}")),
+        }
+    }
+    Ok(absent)
 }
 
 /// One pass: what it changed (empty: nothing).
@@ -145,6 +203,8 @@ fn parse(args: &[String]) -> anyhow::Result<Options> {
         node: std::env::var("NODE_NAME").unwrap_or_default(),
         keytab: PathBuf::from("/etc/krb5.keytab"),
         krb5_conf: None,
+        restart: Vec::new(),
+        systemd: PathBuf::from("/run/systemd/private"),
     };
     for a in args {
         match a.split_once('=') {
@@ -152,7 +212,12 @@ fn parse(args: &[String]) -> anyhow::Result<Options> {
             Some(("--keytab", v)) => o.keytab = v.into(),
             Some(("--krb5-conf", v)) => o.krb5_conf = Some(v.into()),
             Some(("--node", v)) => o.node = v.into(),
-            _ => bail!("unknown argument {a:?} (--keytabs= --keytab= --krb5-conf= --node=)"),
+            Some(("--restart", v)) => match crate::systemd::service_unit(v) {
+                Some(u) => o.restart.push(u),
+                None => bail!("--restart={v:?}: not a service unit name"),
+            },
+            Some(("--systemd", v)) => o.systemd = v.into(),
+            _ => bail!("unknown argument {a:?} (--keytabs= --keytab= --krb5-conf= --node= --restart= --systemd=)"),
         }
     }
     if o.node.is_empty() {
@@ -165,14 +230,33 @@ fn parse(args: &[String]) -> anyhow::Result<Options> {
 pub async fn run(args: &[String]) -> anyhow::Result<()> {
     let o = parse(args)?;
     info!("node-agent for node {}: keys into {}", o.node, o.keytab.display());
+    if !o.restart.is_empty() {
+        info!("Starting {} now, restarting them when a file changes", o.restart.join(", "));
+    }
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut last_error = String::new();
+    let mut logged_absent = Vec::new();
+    let mut pending = owed(Some(Kick::Start), &[], &o.restart);
     loop {
-        match install(&o) {
-            Ok(changed) => {
-                for c in changed {
-                    info!("Installed {c}");
+        let pass = install(&o).and_then(|changed| {
+            for c in &changed {
+                info!("Installed {c}");
+            }
+            pending = owed(pending, &changed, &o.restart);
+            if let Some(k) = pending {
+                let absent = kick(&o.systemd, &o.restart, k)?;
+                pending = None;
+                if absent != logged_absent {
+                    for a in &absent {
+                        warn!("Not on this host, so not (re)started: {a}");
+                    }
+                    logged_absent = absent;
                 }
+            }
+            Ok(())
+        });
+        match pass {
+            Ok(()) => {
                 if !ready() {
                     std::fs::write(ready_mark(), b"")?;
                 }
@@ -180,6 +264,9 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
             }
             Err(e) => {
                 let _ = std::fs::remove_file(ready_mark());
+                // The pass may have written a file before it failed (or the
+                // kick failed): restart once a pass works.
+                pending = owed(pending, &["?".to_string()], &o.restart);
                 let e = format!("{e:#}");
                 if e != last_error {
                     warn!("{e}");
@@ -289,6 +376,8 @@ mod tests {
             node: "w1".into(),
             keytab: host.join("krb5.keytab"),
             krb5_conf: Some(host.join("krb5.conf")),
+            restart: Vec::new(),
+            systemd: PathBuf::new(),
         };
         assert!(install(&o).unwrap_err().to_string().contains("no keys for node w1"));
         let ad = entry("AD.CORP", &["host", "w1"], 23, &[1; 16]);
@@ -323,5 +412,40 @@ mod tests {
         let o = parse(&["--keytab=/host/k".into(), "--node=w9".into(), "--krb5-conf=/host/c".into()]).unwrap();
         assert_eq!((o.keytab, o.node, o.krb5_conf), ("/host/k".into(), "w9".into(), Some("/host/c".into())));
         assert!(parse(&["--bogus".into()]).is_err());
+        assert!(o.restart.is_empty(), "nothing restarted unless asked");
+        let o = parse(&[
+            "--node=w9".into(),
+            "--restart=rpc-gssd".into(),
+            "--restart=gssproxy.service".into(),
+            "--systemd=/host/systemd/private".into(),
+        ])
+        .unwrap();
+        assert_eq!(o.restart, vec!["rpc-gssd.service", "gssproxy.service"]);
+        assert_eq!(o.systemd, PathBuf::from("/host/systemd/private"));
+        assert!(parse(&["--node=w9".into(), "--restart=nfs-client.target".into()]).is_err());
+        assert!(parse(&["--node=w9".into(), "--restart=a;reboot".into()]).is_err());
+    }
+
+    #[test]
+    fn units_are_started_once_and_restarted_when_a_file_changes() {
+        let units = vec!["rpc-gssd.service".to_string()];
+        let changed = vec!["/host/keytab/krb5.keytab".to_string()];
+        // The agent starts owing a start.
+        assert_eq!(owed(Some(Kick::Start), &[], &units), Some(Kick::Start));
+        assert_eq!(owed(Some(Kick::Start), &changed, &units), Some(Kick::Restart), "a restart outranks it");
+        // Done, nothing changed: nothing owed.
+        assert_eq!(owed(None, &[], &units), None);
+        assert_eq!(owed(None, &changed, &units), Some(Kick::Restart), "a rotated key");
+        assert_eq!(owed(Some(Kick::Restart), &[], &units), Some(Kick::Restart), "a failed restart is owed still");
+        // No units: never anything.
+        assert_eq!(owed(Some(Kick::Start), &changed, &[]), None);
+    }
+
+    #[test]
+    fn a_kick_through_a_missing_socket_fails_so_it_is_owed_again() {
+        let d = tempfile::tempdir().unwrap();
+        let units = vec!["rpc-gssd.service".to_string()];
+        assert!(kick(&d.path().join("private"), &units, Kick::Start).is_err());
+        assert!(kick(&d.path().join("private"), &[], Kick::Start).unwrap().is_empty(), "no units, no call");
     }
 }

@@ -282,6 +282,14 @@ pub struct KerberosNodeKeytabSpec {
     /// `/etc/krb5.conf.d/krb5-operator.conf`. Default: none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub krb5_conf_path: Option<String>,
+    /// systemd services on the node to start, and to restart whenever the
+    /// agent writes the keytab or `krb5.conf`, e.g. `[rpc-gssd]`: nfs-utils'
+    /// unit does not run on a node that had no keytab when it booted.
+    /// Default: none. Setting it mounts the host's systemd socket
+    /// (`/run/systemd/private`) into the agent, which lets it start any
+    /// unit: the agent asks for these alone. Nodes must run systemd.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restart_services: Vec<String>,
     /// `Delete` (default) or `Retain` the principals when this is deleted.
     #[serde(default)]
     pub deletion_policy: DeletionPolicy,

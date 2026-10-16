@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **`KerberosNodeKeytab.spec.restartServices`** (e.g. `[rpc-gssd]`): the
+  agent has the node's systemd start each unit when it starts, and restart
+  it whenever it rewrites the keytab or `krb5.conf`. nfs-utils'
+  `rpc-gssd.service` has `ConditionPathExists=/etc/krb5.keytab`, so on a
+  node that booted before its keys came it never ran. Off by default. When
+  set, the agent mounts the host's `/run/systemd/private` (hostPath type
+  `Socket`; no host PID namespace, no capabilities) and calls
+  `StartUnit`/`RestartUnit` over it. Units the node does not have, or has
+  masked, are skipped. Nodes must run systemd. The README also gives a
+  systemd path unit for those who would rather not grant this.
 - **`KerberosNodeKeytab`: each node reads only its own keys.** Every node
   now gets its own Secret and its own DaemonSet, pinned to it, which
   mounts only that Secret. Before, one Secret held every node's keys and

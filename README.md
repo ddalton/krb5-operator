@@ -130,6 +130,7 @@ spec:
   domain: corp.example.com           # for nodes whose hostname has no dot
   keytabPath: /etc/krb5.keytab       # the default
   krb5ConfPath: /etc/krb5.conf.d/corp.conf   # optional
+  restartServices: [rpc-gssd]        # optional; see below
 ```
 
 - For every node the selector and `tolerations` admit, the operator
@@ -157,11 +158,71 @@ spec:
   trusts them), so this needs the API server's Node authorizer and
   `NodeRestriction`, as kubeadm, kind and the managed clusters set up.
 
+#### Making `rpc.gssd` use the keys
+
+nfs-utils' `rpc-gssd.service` has `ConditionPathExists=/etc/krb5.keytab`.
+On a node that booted before the agent wrote its keys, the unit was skipped
+and stays down, so `sec=krb5*` mounts fail until someone starts it.
+`systemctl try-restart` would not help: it restarts only running units.
+
+`restartServices` has the agent do it. When its pod starts, the agent asks
+the host's systemd to start each unit (nothing happens if it runs), and
+whenever it rewrites the keytab or `krb5.conf` it asks for a restart, so
+`rpc.gssd` reads the new keys now, not when it next needs a credential.
+Names without a suffix get `.service`; only service units are accepted. A
+unit the node does not have, or has masked, is skipped and logged once. A
+call that fails is retried every pass, and the node's agent is not ready
+until it works.
+
+The agent reaches systemd through its private socket,
+`/run/systemd/private` (what `systemctl` uses as root), mounted from the
+host. That is the only thing the field adds: no host PID namespace, no
+capabilities, not privileged. The socket admits only uid 0, which the
+agent already is. It is the host's service manager, though, able to start
+anything, so the field is off by default and the agent asks only for the
+units named. The hostPath is of type `Socket`: on a node without systemd
+the agent's pod does not start, and its events say why. Give such nodes
+another `KerberosNodeKeytab` without `restartServices`.
+
+Other ways, and why not:
+
+- `nsenter -t 1 -m -u -i -n -p systemctl restart rpc-gssd` from the
+  agent: needs `hostPID: true` and `CAP_SYS_ADMIN` (in practice
+  `privileged`) to enter the host's namespaces, for the same result.
+- A systemd path unit on the host that restarts `rpc-gssd` on
+  `PathChanged=/etc/krb5.keytab`. It needs no privilege from the operator,
+  and is the choice when you provision nodes yourself (below). The agent
+  cannot install it for you: enabling a unit is a call to systemd, the
+  same access as above, and it would leave units in `/etc/systemd` behind.
+
+```ini
+# /etc/systemd/system/krb5-keytab.path, then:
+#   systemctl enable --now krb5-keytab.path
+[Path]
+PathChanged=/etc/krb5.keytab
+
+[Install]
+WantedBy=paths.target
+
+# /etc/systemd/system/krb5-keytab.service
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl restart rpc-gssd.service
+```
+
+`PathChanged=` fires when the file is written and closed, and when one is
+renamed over it, which is how the agent writes.
+
+On distributions where `rpc.gssd` gets credentials through gssproxy
+(`use-gss-proxy=1` in `nfs.conf`'s `[gssd]`, `GSS_USE_PROXY=yes`), gssproxy
+reads the keytab: name `gssproxy` too. This has not been tested.
+
 What it does not do: per-user identity. Processes that are not root need
 their own tickets, and node keytabs cover root and the NFS client's own
 state. The nodes need `rpc.gssd` (nfs-utils). The agent runs as root with
-no capabilities and writes through hostPath, so the operator's namespace
-must allow privileged pods (`deploy/operator.yaml` labels it). Whoever can
+no capabilities and writes through hostPath (with `restartServices`, it
+also mounts systemd's socket), so the operator's namespace must allow
+privileged pods (`deploy/operator.yaml` labels it). Whoever can
 create pods in the operator's namespace can mount any node's Secret: keep
 that namespace to the operator.
 

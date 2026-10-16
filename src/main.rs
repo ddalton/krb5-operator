@@ -11,6 +11,7 @@ mod crd;
 mod node;
 mod principal;
 mod realm;
+mod systemd;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
