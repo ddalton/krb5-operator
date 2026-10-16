@@ -1057,14 +1057,13 @@ dependencies = [
 
 [[package]]
 name = "krb5"
-version = "0.12.1"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b6d1b71c14b51b04a402b533d022f6c440cbe35e601be59be62641d27c40b98"
+checksum = "88241ff2879375cc1b11d1ce7c80fc20d584e5c1b785799b097abb7173636f09"
 dependencies = [
  "aes",
  "chrono",
  "hmac",
- "pbkdf2",
  "rand",
  "sha1",
  "sha2 0.11.1",
@@ -1346,16 +1345,6 @@ dependencies = [
  "redox_syscall",
  "smallvec",
  "windows-link",
-]
-
-[[package]]
-name = "pbkdf2"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "112d82ceb8c5bf524d9af484d4e4970c9fd5a0cc15ba14ad93dccd28873b0629"
-dependencies = [
- "digest 0.11.3",
- "hmac",
 ]
 
 [[package]]
