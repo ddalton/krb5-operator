@@ -81,6 +81,49 @@ subjects:
     name: krb5-operator
     namespace: krb5-operator
 ---
+# Source: krb5-operator/templates/rbac.yaml
+# In its own namespace only: KerberosNodeKeytabs delete the Secret and
+# DaemonSet of a node that no longer needs them.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: krb5-operator
+  namespace: krb5-operator
+  labels:
+    app.kubernetes.io/name: krb5-operator
+    app.kubernetes.io/instance: krb5-operator
+    app.kubernetes.io/version: "0.3.0"
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: krb5-operator-0.3.0
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [delete]
+  - apiGroups: [apps]
+    resources: [daemonsets]
+    verbs: [delete]
+---
+# Source: krb5-operator/templates/rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: krb5-operator
+  namespace: krb5-operator
+  labels:
+    app.kubernetes.io/name: krb5-operator
+    app.kubernetes.io/instance: krb5-operator
+    app.kubernetes.io/version: "0.3.0"
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: krb5-operator-0.3.0
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: krb5-operator
+subjects:
+  - kind: ServiceAccount
+    name: krb5-operator
+    namespace: krb5-operator
+---
 # Source: krb5-operator/templates/deployment.yaml
 apiVersion: apps/v1
 kind: Deployment

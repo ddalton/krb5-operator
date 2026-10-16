@@ -48,4 +48,37 @@ subjects:
   - kind: ServiceAccount
     name: {{ include "krb5-operator.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
+---
+# In its own namespace only: KerberosNodeKeytabs delete the Secret and
+# DaemonSet of a node that no longer needs them.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "krb5-operator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "krb5-operator.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [delete]
+  - apiGroups: [apps]
+    resources: [daemonsets]
+    verbs: [delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "krb5-operator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "krb5-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "krb5-operator.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "krb5-operator.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
 {{- end }}

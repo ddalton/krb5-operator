@@ -132,11 +132,12 @@ spec:
   krb5ConfPath: /etc/krb5.conf.d/corp.conf   # optional
 ```
 
-- For every node the selector and `tolerations` let the DaemonSet onto, the
-  operator creates `<service>/<node hostname>` and writes the node's keys
-  to a Secret (`node-keytab-<name>`, in the operator's namespace).
-- A DaemonSet of the same name runs `krb5-operator node-agent` on those
-  nodes. The agent merges the node's keys into `keytabPath`: entries of
+- For every node the selector and `tolerations` admit, the operator
+  creates `<service>/<node hostname>` and writes the node's keys to a
+  Secret of the node's own (`node-keytab-<digest>` in the operator's
+  namespace, annotated `krb5.ddalton.dev/node: <node>`).
+- A DaemonSet of the same name, pinned to that node, mounts that Secret
+  and runs `krb5-operator node-agent`. The agent merges the node's keys into `keytabPath`: entries of
   other realms stay, and this realm's are replaced. Files are written
   atomically, only when they change. With `krb5ConfPath` it also writes
   the realm's `krb5.conf` there, naming the KDC by its Service's cluster
@@ -147,16 +148,22 @@ spec:
   from the KDC, and so does deleting the object (unless
   `deletionPolicy: Retain`). Keys already on the node stay in its keytab,
   where they no longer work.
-- Ready means every key got a ticket and the DaemonSet's pod on each node
-  has installed them.
+- Ready means every key got a ticket and each node's agent has installed
+  them.
+- **A node reads only its own keys.** The Node authorizer lets a kubelet
+  read only the Secrets of pods bound to its node, so root on a node gets
+  that node's keys and no other's. A node's keys are what it proves it is
+  with (an NFS server that serves only the nodes a volume is attached to
+  trusts them), so this needs the API server's Node authorizer and
+  `NodeRestriction`, as kubeadm, kind and the managed clusters set up.
 
 What it does not do: per-user identity. Processes that are not root need
 their own tickets, and node keytabs cover root and the NFS client's own
 state. The nodes need `rpc.gssd` (nfs-utils). The agent runs as root with
 no capabilities and writes through hostPath, so the operator's namespace
-must allow privileged pods (`deploy/operator.yaml` labels it). Every agent
-pod mounts the whole Secret, so select only the nodes that mount with
-Kerberos.
+must allow privileged pods (`deploy/operator.yaml` labels it). Whoever can
+create pods in the operator's namespace can mount any node's Secret: keep
+that namespace to the operator.
 
 ### One realm, many products
 
